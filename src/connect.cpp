@@ -578,11 +578,24 @@ static void on_handshake_success(std::shared_ptr<ConnState> state,
         result.handshake_hash = hs.handshake_hash;
         result.remote_public_key = hs.remote_public_key;
         result.peer_address = hp_result.address;
+        result.udx_socket = state->socket->socket_handle();
         result.local_udx_id = state->our_udx_id;
         if (hs.remote_payload.udx.has_value()) {
             result.remote_udx_id = hs.remote_payload.udx->id;
         }
         state->take_raw_stream(result);
+        // JS: connect.js:225 — c.onsocket(socket, addr.port, addr.host)
+        // → c.rawStream.connect(socket, payload.udx.id, port, host)
+        if (result.raw_stream && result.udx_socket &&
+            hs.remote_payload.udx.has_value()) {
+            struct sockaddr_in saddr{};
+            saddr.sin_family = AF_INET;
+            uv_ip4_addr(result.peer_address.host_string().c_str(),
+                        result.peer_address.port, &saddr);
+            udx_stream_connect(result.raw_stream, result.udx_socket,
+                               result.remote_udx_id,
+                               reinterpret_cast<const struct sockaddr*>(&saddr));
+        }
         state->complete(0, result);
         return;
     }
@@ -599,11 +612,27 @@ static void on_handshake_success(std::shared_ptr<ConnState> state,
             result.handshake_hash = hs.handshake_hash;
             result.remote_public_key = hs.remote_public_key;
             result.peer_address = hs.remote_payload.addresses4[0];
+            result.udx_socket = state->socket->socket_handle();
             result.local_udx_id = state->our_udx_id;
             if (hs.remote_payload.udx.has_value()) {
                 result.remote_udx_id = hs.remote_payload.udx->id;
             }
             state->take_raw_stream(result);
+            // JS: connect.js:225 — c.onsocket(socket, addr.port, addr.host)
+            // → c.rawStream.connect(socket, payload.udx.id, port, host).
+            // Without this the client never sends a probe, and the server
+            // never sees the stream → on_raw_stream_firewall on the server
+            // side never fires → no on_connection callback.
+            if (result.raw_stream && result.udx_socket &&
+                hs.remote_payload.udx.has_value()) {
+                struct sockaddr_in saddr{};
+                saddr.sin_family = AF_INET;
+                uv_ip4_addr(result.peer_address.host_string().c_str(),
+                            result.peer_address.port, &saddr);
+                udx_stream_connect(result.raw_stream, result.udx_socket,
+                                   result.remote_udx_id,
+                                   reinterpret_cast<const struct sockaddr*>(&saddr));
+            }
             state->complete(0, result);
         } else {
             state->complete(ConnectError::NO_ADDRESSES);

@@ -1061,6 +1061,24 @@ void Server::on_socket(server_connection::ServerConnection& conn,
         conn.puncher.reset();
     }
 
+    // JS: server.js:331 — `hs.rawStream.connect(socket, payload.udx.id, port, host)`.
+    // The raw stream was created with udx_stream_init + udx_stream_firewall,
+    // which leaves it in a "listening" state. Once the firewall callback has
+    // validated the source address (or holepunch has identified it), we
+    // must connect the stream back to the client so writes (e.g. our Noise
+    // header frame from `SecretStreamDuplex::start()`) actually go out.
+    // Without this the server's stream silently drops every write and the
+    // peer never sees the response → handshake never completes.
+    if (info.raw_stream && info.udx_socket && info.remote_udx_id != 0) {
+        struct sockaddr_in saddr{};
+        saddr.sin_family = AF_INET;
+        uv_ip4_addr(info.peer_address.host_string().c_str(),
+                    info.peer_address.port, &saddr);
+        udx_stream_connect(info.raw_stream, info.udx_socket,
+                           info.remote_udx_id,
+                           reinterpret_cast<const struct sockaddr*>(&saddr));
+    }
+
     DHT_LOG( "  [server] Connection from %s (udx: us=%u them=%u)\n",
             to_hex(conn.remote_public_key.data(), 8).c_str(),
             info.local_udx_id, info.remote_udx_id);
