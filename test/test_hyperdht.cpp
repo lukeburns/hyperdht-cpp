@@ -470,12 +470,26 @@ TEST(HyperDHT, ServerListeningEventFires) {
 
     auto* srv = dht.create_server();
     bool fired = false;
-    srv->on_listening([&fired]() { fired = true; });
+    int err = 0;
+    srv->on_listening([&fired, &err](int e) {
+        fired = true;
+        err = e;
+    });
 
     noise::Seed seed{}; seed.fill(0x33);
     srv->listen(noise::generate_keypair(seed),
                 [](const server::ConnectionInfo&) {});
     EXPECT_TRUE(fired);
+    EXPECT_EQ(err, 0);
+
+    // Re-listen without an intervening close() must surface UV_EALREADY
+    // through the listening hook (B1 — error plumbing).
+    fired = false;
+    err = 0;
+    srv->listen(noise::generate_keypair(seed),
+                [](const server::ConnectionInfo&) {});
+    EXPECT_TRUE(fired);
+    EXPECT_EQ(err, UV_EALREADY);
 
     dht.destroy();
     uv_run(&loop, UV_RUN_DEFAULT);

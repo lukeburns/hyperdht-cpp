@@ -149,7 +149,16 @@ Server::~Server() {
 // ---------------------------------------------------------------------------
 
 void Server::listen(const noise::Keypair& keypair, OnConnectionCb on_connection) {
-    if (listening_) return;
+    if (listening_) {
+        // Caller invoked listen() twice without an intervening close().
+        // JS would silently drop the second call (server.js:143-150 —
+        // the existing listening promise is returned). Fire the
+        // listening hook with -EALREADY so C/C++ callers don't hang
+        // waiting for an event that the existing listener already
+        // emitted.
+        if (on_listening_cb_) on_listening_cb_(UV_EALREADY);
+        return;
+    }
     listening_ = true;
     keypair_ = keypair;
     on_connection_ = std::move(on_connection);
@@ -186,8 +195,9 @@ void Server::listen(const noise::Keypair& keypair, OnConnectionCb on_connection)
     // JS: server.js:195 — `emit('listening')` after announcer.start().
     // Our listen() is synchronous, so fire the hook here on the same
     // tick as listen() returns. Callers that registered on_listening()
-    // BEFORE listen() receive the notification immediately.
-    if (on_listening_cb_) on_listening_cb_();
+    // BEFORE listen() receive the notification immediately. err=0
+    // means the server is ready to accept peers.
+    if (on_listening_cb_) on_listening_cb_(0);
 }
 
 // ---------------------------------------------------------------------------

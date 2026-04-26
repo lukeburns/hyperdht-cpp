@@ -11,6 +11,7 @@ from hyperdht._ffi import (
     CLOSE_CB,
     CONNECTION_CB,
     EVENT_CB,
+    LISTENING_CB,
     FIREWALL_ASYNC_CB,
     FIREWALL_CB,
     HOLEPUNCH_CB,
@@ -152,10 +153,15 @@ class Server:
         _lib.hyperdht_server_notify_online(self._handle)
 
     def on_listening(self, callback: Callable) -> None:
-        """Register callback for when server is ready to accept peers."""
-        @EVENT_CB
-        def cb(ud):
-            callback()
+        """Register callback for when server is ready to accept peers.
+
+        The callback receives a single int argument: 0 on success, a
+        negative libuv-style error code on failure (e.g. -EALREADY for
+        a duplicate listen() without a close()).
+        """
+        @LISTENING_CB
+        def cb(err, ud):
+            callback(err)
 
         self._callbacks.append(cb)
         _lib.hyperdht_server_on_listening(self._handle, cb, None)

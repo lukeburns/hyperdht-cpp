@@ -120,8 +120,12 @@ static void on_connection(const hyperdht_connection_t* conn, void* ud) {
 
 /* --- Server events --- */
 
-static void on_listening(void* ud) {
+static void on_listening(int err, void* ud) {
     (void)ud;
+    if (err) {
+        ESP_LOGE(TAG, "listen failed: err=%d", err);
+        return;
+    }
     ESP_LOGI(TAG, "announced — accepting connections");
     ESP_LOGI(TAG, "  free heap: %zu KB",
              heap_caps_get_free_size(MALLOC_CAP_DEFAULT) / 1024);

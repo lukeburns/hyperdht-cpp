@@ -787,10 +787,19 @@ Java_com_hyperdht_Native_serverPublicKey(JNIEnv* env, jobject, jlong sh, jbyteAr
     return rc == 0 ? JNI_TRUE : JNI_FALSE;
 }
 
+// B1: server_on_listening callback now carries an `int err` argument
+// (0 on success, libuv-style negative on failure such as -EALREADY).
+// The JNI bridge ignores the value for now — Kotlin Runnable.run() has
+// no slot for it — but a future Kotlin-side API can swap to a
+// Function1<Int, Unit> and pull `err` through here.
+static void jni_listening_cb(int /*err*/, void* ud) {
+    jni_event_cb(ud);
+}
+
 extern "C" JNIEXPORT void JNICALL
 Java_com_hyperdht_Native_serverOnListening(JNIEnv* env, jobject, jlong sh, jobject jcb) {
     auto* ref = new jobject(env->NewGlobalRef(jcb));
-    hyperdht_server_on_listening((hyperdht_server_t*)sh, jni_event_cb, ref);
+    hyperdht_server_on_listening((hyperdht_server_t*)sh, jni_listening_cb, ref);
 }
 
 extern "C" JNIEXPORT void JNICALL

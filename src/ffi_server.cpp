@@ -139,10 +139,10 @@ int hyperdht_server_public_key(const hyperdht_server_t* srv,
 }
 
 void hyperdht_server_on_listening(hyperdht_server_t* srv,
-                                  hyperdht_event_cb cb, void* userdata) {
+                                  hyperdht_listening_cb cb, void* userdata) {
     if (!srv || !srv->server) return;
     if (!cb) { srv->server->on_listening(nullptr); return; }
-    srv->server->on_listening([cb, userdata]() { cb(userdata); });
+    srv->server->on_listening([cb, userdata](int err) { cb(err, userdata); });
 }
 
 int hyperdht_server_address(const hyperdht_server_t* srv,

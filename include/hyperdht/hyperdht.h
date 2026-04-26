@@ -875,14 +875,22 @@ HYPERDHT_API int  hyperdht_server_public_key(const hyperdht_server_t* srv,
                                               uint8_t out[32]);
 
 /**
- * Install a 'listening' event callback — fires ONCE after the announcer
- * finishes its first cycle, when the server is fully ready to accept
- * peers. JS parity: `server.on('listening', ...)` at server.js:195.
+ * Install a 'listening' event callback — fires ONCE per `listen()`
+ * call, when the server is either fully ready to accept peers (err = 0)
+ * or rejected the call outright (err < 0, libuv error code such as
+ * UV_EALREADY for a duplicate `listen()` without an intervening
+ * `close()`). JS parity: `server.on('listening', ...)` at
+ * server.js:195. JS has no equivalent error path — it relies on the
+ * absence of `listening` emission as the signal — but C/C++ callers
+ * cannot detect "callback never fires" cleanly, so we always fire it
+ * exactly once per listen() invocation.
  *
  * A later `close() + listen()` cycle re-arms the hook.
  */
+typedef void (*hyperdht_listening_cb)(int err, void* userdata);
+
 HYPERDHT_API void hyperdht_server_on_listening(hyperdht_server_t* srv,
-                                                hyperdht_event_cb cb,
+                                                hyperdht_listening_cb cb,
                                                 void* userdata);
 
 /**

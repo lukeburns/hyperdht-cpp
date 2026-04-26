@@ -148,6 +148,9 @@ DONE_CB = ctypes.CFUNCTYPE(None, ctypes.c_int, ctypes.c_void_p)
 DATA_CB = ctypes.CFUNCTYPE(
     None, ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t, ctypes.c_void_p)
 EVENT_CB = ctypes.CFUNCTYPE(None, ctypes.c_void_p)
+# B1: server `on_listening` reports an int error code on top of the
+# usual void* userdata. 0 = listening, negative = libuv-style error.
+LISTENING_CB = ctypes.CFUNCTYPE(None, ctypes.c_int, ctypes.c_void_p)
 PEER_CB = ctypes.CFUNCTYPE(
     None, ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t,
     ctypes.c_char_p, ctypes.c_uint16, ctypes.c_void_p)
@@ -325,7 +328,7 @@ lib.hyperdht_server_public_key.argtypes = [
 lib.hyperdht_server_public_key.restype = ctypes.c_int
 
 lib.hyperdht_server_on_listening.argtypes = [
-    ctypes.c_void_p, EVENT_CB, ctypes.c_void_p]
+    ctypes.c_void_p, LISTENING_CB, ctypes.c_void_p]
 lib.hyperdht_server_on_listening.restype = None
 
 lib.hyperdht_server_address.argtypes = [

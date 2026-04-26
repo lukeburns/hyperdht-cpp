@@ -121,8 +121,18 @@ public:
     // Our listen() is synchronous, so the callback fires on the same
     // tick as listen() returns (unlike JS which awaits internal async).
     //
+    // The callback receives an error code: 0 on success, negative on
+    // failure (libuv-style: e.g. -EALREADY when listen() was called
+    // twice in succession without an intervening close()). Today only
+    // -EALREADY is wired in; bind/announcer-start failures fire on the
+    // same path once those propagate errors synchronously. JS doesn't
+    // have a parity for this — it relies on the absence of `listening`
+    // emission as the failure signal — but C/C++ callers cannot detect
+    // "callback never fires" cleanly, so we always fire it exactly once
+    // per listen() invocation.
+    //
     // A later listen() / close()+listen() cycle re-arms the hook.
-    using OnListeningCb = std::function<void()>;
+    using OnListeningCb = std::function<void(int err)>;
     void on_listening(OnListeningCb cb) { on_listening_cb_ = std::move(cb); }
 
     // Stop listening: stop announcer, remove from router, clean up

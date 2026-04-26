@@ -127,8 +127,12 @@ int main(int argc, char** argv) {
     // Create server
     hyperdht_server_t* srv = hyperdht_server_create(dht);
 
-    hyperdht_server_on_listening(srv, [](void*) {
-        printf("[event] Server announced — accepting peers\n");
+    hyperdht_server_on_listening(srv, [](int err, void*) {
+        if (err == 0) {
+            printf("[event] Server announced — accepting peers\n");
+        } else {
+            printf("[event] Server listen failed (err=%d)\n", err);
+        }
         fflush(stdout);
     }, nullptr);
 
