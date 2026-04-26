@@ -400,6 +400,49 @@ public:
         return socket_ && !socket_->is_ephemeral();
     }
 
+    // Force the underlying RPC socket's firewalled state. Mirrors what
+    // `bootstrapper()` (and JS `firewalled: false` opts) does: nodes that
+    // know they are reachable (e.g. localhost testnet members) can set
+    // this to false so they advertise as OPEN immediately, before NAT
+    // sampling has run. No-op until `bind()` has constructed the socket.
+    //
+    // JS reference: `dht-rpc/index.js:104-120` (`bootstrapper`) and the
+    // `firewalled: false` option fed to testnet members.
+    void set_firewalled(bool v) {
+        if (socket_) socket_->set_firewalled(v);
+    }
+    bool is_firewalled() const {
+        return socket_ ? socket_->is_firewalled() : true;
+    }
+
+    // Pin this DHT to a known external address — see
+    // `RpcSocket::force_persistent`. Used by the localhost testnet
+    // helper (`hyperdht/testnet.hpp`) so members get stable
+    // address-based ids before the first packet flies, working around
+    // the chicken-and-egg between routing-table validation and NAT
+    // sampling that JS dodges via `DHT.bootstrapper`'s pre-seeded
+    // `_nat.add(host, port)` (single-sample classification in the JS
+    // NatSampler vs ≥3 samples in our port).
+    //
+    // After flipping the socket persistent we trigger a `refresh()` so
+    // any in-flight bootstrap walk's follow-on requests are encoded
+    // with the freshly-rebuilt table id (encoding happens inside
+    // `RpcSocket::request`, which gates the id-on-wire flag on
+    // `!ephemeral_ && !firewalled_`). Without that re-walk, peers
+    // receiving the original ephemeral-encoded requests would never
+    // validate this node's id and so would never add it to their
+    // routing tables.
+    //
+    // No-op until `bind()` has constructed the socket. Idempotent on
+    // repeat calls with the same address. Production nodes should
+    // leave the natural NAT-sampling path alone.
+    void force_persistent(const compact::Ipv4Address& addr) {
+        if (!socket_) return;
+        const bool was_ephemeral = socket_->is_ephemeral();
+        socket_->force_persistent(addr);
+        if (was_ephemeral && bound_) refresh();
+    }
+
     // Test hook: invoke the network-change fan-out directly without
     // waiting for a real interface event. Used by unit tests to
     // exercise the server-refresh + user-callback path deterministically.

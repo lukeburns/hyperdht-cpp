@@ -346,6 +346,23 @@ uint16_t RpcSocket::request(const messages::Request& req,
     messages::Request msg = req;
     msg.tid = alloc_tid();
 
+    // JS: dht-rpc/lib/io.js:521 + 544 — `_encodeRequest` includes
+    // `table.id` only when sending from the server socket while
+    // non-ephemeral. JS picks the socket via `firewalled ? clientSocket
+    // : serverSocket` (lib/io.js:321), so the effective predicate for
+    // "this request advertises our id on the wire" is
+    // `!firewalled && !ephemeral`. Our single-socket port collapses
+    // that to the same boolean.
+    //
+    // Without this, persistent peers (e.g. localhost testnet members)
+    // never end up in each other's routing tables when they receive
+    // requests with no id — `add_node_from_network` requires a
+    // validated id, so the table stays empty even though responses
+    // properly carry the id field.
+    if (!ephemeral_ && !firewalled_ && !msg.id.has_value()) {
+        msg.id = table_.id();
+    }
+
     // Create inflight entry
     auto* inflight = new InflightRequest;
     inflight->owner = this;
@@ -1048,6 +1065,35 @@ void RpcSocket::do_persistent_transition() {
     auto our_addr = compact::Ipv4Address::from_string(
         current_host, nat_sampler_.port());
     auto new_id = compute_peer_id(our_addr);
+    if (new_id != table_.id()) {
+        table_.rebuild_with_id(new_id);
+    }
+
+    if (on_persistent_) on_persistent_();
+}
+
+// force_persistent — collapse the bootstrapper + NAT-sampled rebuild path.
+//
+// JS analogue: `DHT.bootstrapper(port, host)` followed by the relevant
+// branch of `_updateNetworkState` that promotes the table id to
+// `peer.id(host, port)`. We expose it as a single synchronous call so
+// localhost testnet members can skip the NAT sampling window — they
+// already know their bind address.
+//
+// Always pairs the routing-table rebuild with the same `on_persistent_`
+// fan-out as the production path. HyperDHT routes that to
+// `fire_persistent()`, which in turn re-runs `refresh()` if the socket
+// is already bootstrapped, so a late-call after the bootstrap walk
+// completes still re-walks with the new id.
+// ---------------------------------------------------------------------------
+
+void RpcSocket::force_persistent(const compact::Ipv4Address& addr) {
+    if (!ephemeral_) return;
+
+    ephemeral_ = false;
+    firewalled_ = false;
+
+    auto new_id = compute_peer_id(addr);
     if (new_id != table_.id()) {
         table_.rebuild_with_id(new_id);
     }

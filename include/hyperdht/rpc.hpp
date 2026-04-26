@@ -268,6 +268,25 @@ public:
         do_persistent_transition();
     }
 
+    // Pin this socket to a known external address — flips ephemeral→
+    // persistent, marks the firewall as OPEN, and rebuilds the routing
+    // table with the BLAKE2b(host:port) id that the rest of the network
+    // computes from our wire address.
+    //
+    // This is the C++ analogue of JS `DHT.bootstrapper(port, host)` plus
+    // the post-bootstrap `_updateNetworkState` rebuild collapsed into a
+    // single deterministic call. It exists primarily for test fixtures
+    // (e.g. localhost testnet members) where NAT sampling has no real
+    // signal to lock onto — every member knows its own bind address up
+    // front, so we skip the sampling window entirely. Production nodes
+    // should let the background tick + NAT sampler drive the same
+    // transition naturally.
+    //
+    // Idempotent: a second call with the same address is a no-op once
+    // `ephemeral_` has flipped to false. Calling this after a real NAT
+    // sampling run is safe but redundant.
+    void force_persistent(const compact::Ipv4Address& addr);
+
     // Directly fire the `on_health_change_` callback. Test-only hook used
     // to verify §15 network-update wiring without driving four background
     // ticks worth of synthetic timeouts through the health monitor.
