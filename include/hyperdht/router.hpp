@@ -11,6 +11,7 @@
 //   Server responds → Router sends back as REPLY to Client
 
 #include <functional>
+#include <optional>
 #include <unordered_map>
 #include <vector>
 
@@ -47,6 +48,16 @@ struct ForwardEntry {
     HandshakeFn on_peer_handshake;
     HolepunchFn on_peer_holepunch;
     std::vector<uint8_t> record;  // Encoded PeerRecord for FIND_PEER responses
+
+    // Relay address for entries that are not local servers. JS:
+    // `lib/persistent.js:132-138` (announceSelf branch of onannounce) and
+    // `lib/router.js:88-89` — when a node receives a self-announce
+    // (target == BLAKE2b(pk)) it stashes the announcer's address as a
+    // `relay` so subsequent PEER_HANDSHAKE / PEER_HOLEPUNCH requests
+    // targeting that pk can be forwarded one hop closer to the actual
+    // server. `on_peer_handshake` is null for these entries — the
+    // router decides locally vs. relay via the field's presence.
+    std::optional<compact::Ipv4Address> relay;
 };
 
 // ---------------------------------------------------------------------------

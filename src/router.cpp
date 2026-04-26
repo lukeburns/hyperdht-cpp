@@ -77,24 +77,76 @@ bool Router::handle_peer_handshake(const messages::Request& req,
     std::copy(req.target->begin(), req.target->end(), target.begin());
 
     auto* entry = get(target);
-    if (!entry || !entry->on_peer_handshake) {
+    if (!entry) {
         DHT_LOG( "  [router] HS: target %02x%02x... not in router (size=%zu)\n",
                 target[0], target[1], forwards_.size());
         return false;
     }
+
     // Decode the handshake message to extract noise bytes + peerAddress
     auto hs_msg = peer_connect::decode_handshake_msg(
         req.value->data(), req.value->size());
+    if (hs_msg.noise.empty()) return false;
+    if (hs_msg.mode != peer_connect::MODE_FROM_CLIENT &&
+        hs_msg.mode != peer_connect::MODE_FROM_RELAY &&
+        hs_msg.mode != peer_connect::MODE_FROM_SECOND_RELAY &&
+        hs_msg.mode != peer_connect::MODE_FROM_SERVER) return false;
+
+    // ----- Relay-only entry path -----
+    // JS parity: lib/router.js:128-170 (the `else` branch when state has
+    // no `onpeerhandshake`, only `relay`). We act as a forwarder one hop
+    // closer to the actual server.
+    if (!entry->on_peer_handshake) {
+        if (!entry->relay.has_value()) return false;
+        const auto relay_addr = *entry->relay;
+
+        switch (hs_msg.mode) {
+            case peer_connect::MODE_FROM_CLIENT: {
+                // Forward FROM_CLIENT → FROM_RELAY toward the server,
+                // stashing the original client's wire address so the
+                // server's reply can be routed back through us.
+                peer_connect::HandshakeMessage fwd;
+                fwd.mode = peer_connect::MODE_FROM_RELAY;
+                fwd.noise = hs_msg.noise;
+                fwd.peer_address = req.from.addr;
+
+                messages::Request fwd_req;
+                fwd_req.tid = req.tid;
+                fwd_req.to.addr = relay_addr;
+                fwd_req.command = req.command;
+                fwd_req.target = req.target;
+                fwd_req.internal = false;
+                fwd_req.value = peer_connect::encode_handshake_msg(fwd);
+                relay(fwd_req);
+                return true;
+            }
+            case peer_connect::MODE_FROM_SERVER: {
+                // Server's reply coming back through us — convert to
+                // REPLY mode for the original client whose address is
+                // carried in `peerAddress`.
+                if (!hs_msg.peer_address.has_value()) return false;
+                peer_connect::HandshakeMessage rep;
+                rep.mode = peer_connect::MODE_REPLY;
+                rep.noise = hs_msg.noise;
+                rep.peer_address = req.from.addr;
+
+                messages::Response resp;
+                resp.tid = req.tid;
+                resp.from.addr = *hs_msg.peer_address;  // routed-to client
+                resp.value = peer_connect::encode_handshake_msg(rep);
+                reply(resp);
+                return true;
+            }
+            default:
+                // FROM_RELAY / FROM_SECOND_RELAY at a relay node would
+                // require a second forwarding hop. Unsupported for now;
+                // see `relay/peer_connect/holepunch` follow-up TODO.
+                return false;
+        }
+    }
 
     DHT_LOG( "  [router] HS: target FOUND, noise=%zu bytes, mode=%u\n",
             hs_msg.noise.size(), hs_msg.mode);
-
-    // Validate: noise bytes must be non-empty
-    if (hs_msg.noise.empty()) return false;
-    // Accept all valid incoming modes (FROM_CLIENT=0, FROM_RELAY=2, FROM_SECOND_RELAY=3)
-    if (hs_msg.mode != peer_connect::MODE_FROM_CLIENT &&
-        hs_msg.mode != peer_connect::MODE_FROM_RELAY &&
-        hs_msg.mode != peer_connect::MODE_FROM_SECOND_RELAY) return false;
 
     // The client's address (FROM_RELAY: from the peerAddress field; FROM_CLIENT: from the packet)
     auto client_addr = hs_msg.peer_address.value_or(req.from.addr);
@@ -177,12 +229,54 @@ bool Router::handle_peer_holepunch(const messages::Request& req,
     std::copy(req.target->begin(), req.target->end(), target.begin());
 
     auto* entry = get(target);
-    if (!entry || !entry->on_peer_holepunch) return false;
+    if (!entry) return false;
 
     // Decode the holepunch message to determine the mode
     auto hp_msg = holepunch::decode_holepunch_msg(req.value->data(), req.value->size());
     auto incoming_mode = hp_msg.mode;
     auto client_addr = hp_msg.peer_address.value_or(req.from.addr);
+
+    // ----- Relay-only entry path (announceSelf forwards) -----
+    // JS parity: lib/router.js:212-247 — relay-only nodes forward
+    // FROM_CLIENT messages to the announcer/server and convert
+    // FROM_SERVER messages back into REPLYs for the original client.
+    if (!entry->on_peer_holepunch) {
+        if (!entry->relay.has_value()) return false;
+        const auto relay_addr = *entry->relay;
+
+        switch (incoming_mode) {
+            case peer_connect::MODE_FROM_CLIENT: {
+                holepunch::HolepunchMessage fwd = hp_msg;
+                fwd.mode = peer_connect::MODE_FROM_RELAY;
+                fwd.peer_address = req.from.addr;
+
+                messages::Request fwd_req;
+                fwd_req.tid = req.tid;
+                fwd_req.to.addr = relay_addr;
+                fwd_req.command = req.command;
+                fwd_req.target = req.target;
+                fwd_req.internal = false;
+                fwd_req.value = holepunch::encode_holepunch_msg(fwd);
+                relay(fwd_req);
+                return true;
+            }
+            case peer_connect::MODE_FROM_SERVER: {
+                if (!hp_msg.peer_address.has_value()) return false;
+                holepunch::HolepunchMessage rep = hp_msg;
+                rep.mode = peer_connect::MODE_REPLY;
+                rep.peer_address = req.from.addr;
+
+                messages::Response resp;
+                resp.tid = req.tid;
+                resp.from.addr = *hp_msg.peer_address;
+                resp.value = holepunch::encode_holepunch_msg(rep);
+                reply(resp);
+                return true;
+            }
+            default:
+                return false;
+        }
+    }
 
     // Capture only needed fields (avoid copying the full Request)
     auto req_tid = req.tid;

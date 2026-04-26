@@ -29,6 +29,7 @@
 #include "hyperdht/rpc_handlers.hpp"
 
 #include <cassert>
+#include <cstring>
 
 #include <sodium.h>
 
@@ -531,19 +532,48 @@ void RpcHandlers::handle_announce(const messages::Request& req) {
     announce::TargetKey target{};
     std::copy(req.target->begin(), req.target->end(), target.begin());
 
-    // Store the announcement. `ann_ttl_ms_` is plumbed from
-    // `DhtOptions::max_age_ms` via `StorageCacheConfig`, matching the JS
-    // `persistent.records: { maxAge: opts.maxAge }` pattern in
-    // `hyperdht/index.js:607,599`. Defaults to 20 min when the caller
-    // leaves the option at its default value.
-    assert(socket_.loop() != nullptr);
-    announce::PeerAnnouncement stored;
-    stored.from = req.from.addr;
-    stored.value = *req.value;
-    stored.created_at = uv_now(socket_.loop());
-    stored.ttl = ann_ttl_ms_;
+    // JS parity: persistent.js:130 stores the *peer record* (publicKey +
+    // relayAddresses), NOT the full announce message. LOOKUP / FIND_PEER
+    // replies surface this blob directly to the calling client which
+    // decodes it as `m.peer`.
+    auto peer_blob = dht_messages::encode_peer_record(*ann.peer);
 
-    store_.put(target, stored);
+    // JS parity (lib/persistent.js:127-144 — `announceSelf` branch):
+    // when the announce target equals BLAKE2b(peer.publicKey) the sender
+    // is announcing itself as a server. JS routes self-announces to
+    // `dht._router` only (with `records.remove(k, peer.publicKey)`); the
+    // announce store does not double-track them. The router entry's
+    // `relay` field lets us forward inbound PEER_HANDSHAKE /
+    // PEER_HOLEPUNCH packets one hop closer to the actual server.
+    std::array<uint8_t, 32> pk_hash{};
+    crypto_generichash(pk_hash.data(), pk_hash.size(),
+                       ann.peer->public_key.data(),
+                       ann.peer->public_key.size(),
+                       nullptr, 0);
+    const bool announce_self =
+        std::memcmp(pk_hash.data(), req.target->data(), 32) == 0;
+    if (router_ && announce_self) {
+        router::ForwardEntry entry;
+        entry.relay = req.from.addr;
+        entry.record = peer_blob;
+        router_->set(target, std::move(entry));
+        // JS parity: persistent.js:139 — `records.remove(k, peer.publicKey)`
+        // ensures the self-announce never lives in two places.
+        store_.remove(target, req.from.addr);
+    } else {
+        // Store the announcement. `ann_ttl_ms_` is plumbed from
+        // `DhtOptions::max_age_ms` via `StorageCacheConfig`, matching
+        // JS `persistent.records: { maxAge: opts.maxAge }`
+        // (hyperdht/index.js:607,599). Defaults to 20 min.
+        assert(socket_.loop() != nullptr);
+        announce::PeerAnnouncement stored;
+        stored.from = req.from.addr;
+        stored.value = std::move(peer_blob);
+        stored.created_at = uv_now(socket_.loop());
+        stored.ttl = ann_ttl_ms_;
+
+        store_.put(target, stored);
+    }
 
     // Reply (JS: { token: false, closerNodes: false })
     messages::Response resp;
@@ -603,6 +633,32 @@ void RpcHandlers::handle_unannounce(const messages::Request& req) {
 
     // Remove the announcement from this sender
     store_.remove(target, req.from.addr);
+
+    // JS parity: persistent.js's `_onunannounce` strips both the records
+    // entry and any router self-relay entry installed by `_onannounce`
+    // when the unannouncing client matches the relay address. Without
+    // the router cleanup here, FIND_PEER would still return the stale
+    // self-relay long after the server departed.
+    std::array<uint8_t, 32> pk_hash_un{};
+    crypto_generichash(pk_hash_un.data(), pk_hash_un.size(),
+                       ann.peer->public_key.data(),
+                       ann.peer->public_key.size(),
+                       nullptr, 0);
+    const bool self_un =
+        std::memcmp(pk_hash_un.data(), req.target->data(), 32) == 0;
+    if (router_ && self_un) {
+        if (auto* existing = router_->get(target)) {
+            // Only drop relay-only entries we owned — don't yank a
+            // local server's `on_peer_handshake`/`on_peer_holepunch`
+            // callbacks just because a stranger sent us an unannounce.
+            if (!existing->on_peer_handshake && !existing->on_peer_holepunch &&
+                existing->relay.has_value() &&
+                existing->relay->host_string() == req.from.addr.host_string() &&
+                existing->relay->port == req.from.addr.port) {
+                router_->remove(target);
+            }
+        }
+    }
 
     messages::Response resp;
     resp.tid = req.tid;
