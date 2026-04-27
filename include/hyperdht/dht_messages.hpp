@@ -13,7 +13,7 @@
 // MutableGetResponse: uint(seq) + buffer(value) + fixed64(signature)
 // MutableSignable:    uint(seq) + buffer(value)
 //
-// LookupRawReply:     array(raw)(peers) + uint(bump)
+// LookupRawReply:     uint(count) + count*peer_struct + uint(bump)
 
 #include <array>
 #include <cstdint>
@@ -96,11 +96,18 @@ MutableGetResponse decode_mutable_get_resp(const uint8_t* data, size_t len);
 std::vector<uint8_t> encode_mutable_signable(uint64_t seq, const uint8_t* value, size_t len);
 
 // ---------------------------------------------------------------------------
-// LookupRawReply — value field of LOOKUP response (array of raw peer records)
+// LookupRawReply — value field of LOOKUP response (array of peer records).
+// JS wire format (compact-encoding `c.array(peer)`):
+//   uint(count) + count * (fixed32(pubkey) + ipv4Array(relays))
+// — peer structs are concatenated back-to-back with NO per-peer length
+// prefix. The C++ port previously wrapped each peer in a `Buffer` (varint
+// length + bytes), which is incompatible with JS-emitted lookup replies and
+// caused the C++ adapter to silently drop every peer surfaced from the
+// public DHT.
 // ---------------------------------------------------------------------------
 
 struct LookupRawReply {
-    std::vector<std::vector<uint8_t>> peers;  // Raw encoded PeerRecord bytes
+    std::vector<PeerRecord> peers;
     uint64_t bump = 0;
 };
 

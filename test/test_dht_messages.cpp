@@ -218,15 +218,14 @@ TEST(MutableSignable, Encoding) {
 TEST(LookupReply, RoundTrip) {
     LookupRawReply r;
 
-    // Add two peer records as raw bytes
     PeerRecord p1;
     p1.public_key.fill(0x11);
-    r.peers.push_back(encode_peer_record(p1));
+    r.peers.push_back(p1);
 
     PeerRecord p2;
     p2.public_key.fill(0x22);
     p2.relay_addresses.push_back(Ipv4Address::from_string("1.2.3.4", 5000));
-    r.peers.push_back(encode_peer_record(p2));
+    r.peers.push_back(p2);
 
     r.bump = 999;
 
@@ -236,13 +235,9 @@ TEST(LookupReply, RoundTrip) {
     ASSERT_EQ(decoded.peers.size(), 2u);
     EXPECT_EQ(decoded.bump, 999u);
 
-    // Decode the first peer record
-    auto dp1 = decode_peer_record(decoded.peers[0].data(), decoded.peers[0].size());
-    EXPECT_EQ(dp1.public_key[0], 0x11);
-
-    auto dp2 = decode_peer_record(decoded.peers[1].data(), decoded.peers[1].size());
-    EXPECT_EQ(dp2.public_key[0], 0x22);
-    ASSERT_EQ(dp2.relay_addresses.size(), 1u);
+    EXPECT_EQ(decoded.peers[0].public_key[0], 0x11);
+    EXPECT_EQ(decoded.peers[1].public_key[0], 0x22);
+    ASSERT_EQ(decoded.peers[1].relay_addresses.size(), 1u);
 }
 
 TEST(LookupReply, Empty) {

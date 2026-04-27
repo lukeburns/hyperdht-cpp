@@ -272,10 +272,12 @@ std::vector<uint8_t> encode_mutable_signable(uint64_t seq, const uint8_t* value,
 std::vector<uint8_t> encode_lookup_reply(const LookupRawReply& r) {
     State state;
 
-    // Array of raw buffers: varint(count) + [buffer, buffer, ...]
+    // JS-compatible: uint(count) + count*(fixed32 pubkey + ipv4Array relays).
+    // Peer structs are concatenated with no per-peer length prefix.
     Uint::preencode(state, static_cast<uint64_t>(r.peers.size()));
     for (const auto& peer : r.peers) {
-        Buffer::preencode(state, peer.data(), peer.size());
+        Fixed32::preencode(state, peer.public_key);
+        Array<Ipv4Addr, Ipv4Address>::preencode(state, peer.relay_addresses);
     }
     Uint::preencode(state, r.bump);
 
@@ -285,7 +287,8 @@ std::vector<uint8_t> encode_lookup_reply(const LookupRawReply& r) {
 
     Uint::encode(state, static_cast<uint64_t>(r.peers.size()));
     for (const auto& peer : r.peers) {
-        Buffer::encode(state, peer.data(), peer.size());
+        Fixed32::encode(state, peer.public_key);
+        Array<Ipv4Addr, Ipv4Address>::encode(state, peer.relay_addresses);
     }
     Uint::encode(state, r.bump);
 
@@ -301,11 +304,12 @@ LookupRawReply decode_lookup_reply(const uint8_t* data, size_t len) {
     r.peers.reserve(static_cast<size_t>(count));
 
     for (uint64_t i = 0; i < count && !state.error; i++) {
-        auto buf = Buffer::decode(state);
+        PeerRecord peer;
+        peer.public_key = Fixed32::decode(state);
         if (state.error) return r;
-        if (!buf.is_null()) {
-            r.peers.emplace_back(buf.data, buf.data + buf.len);
-        }
+        peer.relay_addresses = Array<Ipv4Addr, Ipv4Address>::decode(state);
+        if (state.error) return r;
+        r.peers.push_back(std::move(peer));
     }
 
     // bump is optional — 0 if past end
