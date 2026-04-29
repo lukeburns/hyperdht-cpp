@@ -710,12 +710,31 @@ static void on_handshake_success(std::shared_ptr<ConnState> state,
                     result.handshake_hash = state->hs_result.handshake_hash;
                     result.remote_public_key = state->hs_result.remote_public_key;
                     result.peer_address = lan_addr;
+                    result.udx_socket = state->socket->socket_handle();
                     result.local_udx_id = state->our_udx_id;
                     if (state->hs_result.remote_payload.udx.has_value()) {
                         result.remote_udx_id =
                             state->hs_result.remote_payload.udx->id;
                     }
                     state->take_raw_stream(result);
+                    // Wire the raw UDX stream to the LAN peer. Without this
+                    // the client never writes to the stream, the server's
+                    // pre-created rawStream never fires its firewall callback,
+                    // and on_connection never fires on the responder — so a
+                    // CPP↔CPP same-LAN connect "succeeds" on the initiator
+                    // and silently dies on the responder. JS connect.js:225
+                    // (c.onsocket) does the equivalent stream.connect call.
+                    if (result.raw_stream && result.udx_socket &&
+                        state->hs_result.remote_payload.udx.has_value()) {
+                        struct sockaddr_in saddr{};
+                        saddr.sin_family = AF_INET;
+                        uv_ip4_addr(lan_addr.host_string().c_str(),
+                                    lan_addr.port, &saddr);
+                        udx_stream_connect(
+                            result.raw_stream, result.udx_socket,
+                            result.remote_udx_id,
+                            reinterpret_cast<const struct sockaddr*>(&saddr));
+                    }
                     state->complete(0, result);
                 });
             // Note: we do NOT return here. The holepunch below runs in
