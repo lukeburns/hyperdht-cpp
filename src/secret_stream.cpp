@@ -10,6 +10,7 @@
 #include <sodium.h>
 
 #include <cassert>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -620,6 +621,20 @@ void SecretStreamDuplex::destroy(int error) {
 void SecretStreamDuplex::fire_close(int err) {
     if (on_close_fired_) return;
     on_close_fired_ = true;
+    // Set HYPERSWARM_SECRET_STREAM_TRACE=1 to log header-handshake state at
+    // on_close (parity / early-teardown investigation; see example-parity).
+    if (const char* tr = std::getenv("HYPERSWARM_SECRET_STREAM_TRACE")) {
+        if (tr[0] != '0' && tr[0] != '\0') {
+            const char* st = uv_strerror(err);
+            if (!st) st = "";
+            std::fprintf(stderr,
+                         "[secret_stream_duplex] fire_close err=%d (%s) "
+                         "header_sent=%d header_recv=%d connected=%d started=%d "
+                         "close_error_=%d\n",
+                         err, st, (int)header_sent_, (int)header_received_,
+                         (int)connected_, (int)started_, close_error_);
+        }
+    }
     if (on_close_) on_close_(err);
 }
 

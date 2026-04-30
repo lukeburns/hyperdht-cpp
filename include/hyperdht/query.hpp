@@ -27,7 +27,12 @@
 namespace hyperdht {
 namespace query {
 
-constexpr int DEFAULT_CONCURRENCY = 10;
+// JS parity: dht-rpc/lib/query.js sets `this.concurrency = io.concurrency`,
+// where `io.concurrency = 16` by default in dht-rpc/index.js. The C++ port
+// previously defaulted to 10, which narrowed the walk and let two parallel
+// joiners converge to disjoint "closest k" sets — neither would see the
+// other's announces because both stored to non-overlapping nodes. Match JS.
+constexpr int DEFAULT_CONCURRENCY = 16;
 constexpr int SLOWDOWN_CONCURRENCY = 3;
 
 // ---------------------------------------------------------------------------

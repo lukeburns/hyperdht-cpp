@@ -605,13 +605,31 @@ static void on_handshake_success(std::shared_ptr<ConnState> state,
     if (!hs.remote_payload.holepunch.has_value() ||
         hs.remote_payload.holepunch->relays.empty()) {
         if (!hs.remote_payload.addresses4.empty()) {
+            // If both peers sit behind the same NAT, the first advertised
+            // address is typically the NAT'd public IP, and most home NATs
+            // do not hairpin (UDP sent to our own public IP from inside the
+            // LAN is dropped). Prefer an address that matches one of our
+            // local interfaces — same logic the holepunch path runs at the
+            // LAN shortcut. Without this, two CPP peers on one machine
+            // complete the noise IK over relays, then their UDX stream
+            // writes silently rto-retransmit forever.
+            auto my_local = holepunch::local_addresses(0);
+            auto matched = holepunch::match_address(
+                my_local, hs.remote_payload.addresses4);
+            auto target_addr = matched.value_or(hs.remote_payload.addresses4[0]);
+            if (matched.has_value()) {
+                DHT_LOG("  [connect] direct-connect (relays=0): LAN-local "
+                        "%s:%u (matched=yes)\n",
+                        target_addr.host_string().c_str(), target_addr.port);
+            }
+
             ConnectResult result;
             result.success = true;
             result.tx_key = hs.tx_key;
             result.rx_key = hs.rx_key;
             result.handshake_hash = hs.handshake_hash;
             result.remote_public_key = hs.remote_public_key;
-            result.peer_address = hs.remote_payload.addresses4[0];
+            result.peer_address = target_addr;
             result.udx_socket = state->socket->socket_handle();
             result.local_udx_id = state->our_udx_id;
             if (hs.remote_payload.udx.has_value()) {
@@ -627,8 +645,8 @@ static void on_handshake_success(std::shared_ptr<ConnState> state,
                 hs.remote_payload.udx.has_value()) {
                 struct sockaddr_in saddr{};
                 saddr.sin_family = AF_INET;
-                uv_ip4_addr(result.peer_address.host_string().c_str(),
-                            result.peer_address.port, &saddr);
+                uv_ip4_addr(target_addr.host_string().c_str(),
+                            target_addr.port, &saddr);
                 udx_stream_connect(result.raw_stream, result.udx_socket,
                                    result.remote_udx_id,
                                    reinterpret_cast<const struct sockaddr*>(&saddr));

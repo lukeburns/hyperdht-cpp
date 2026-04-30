@@ -2,7 +2,12 @@
 
 Tasks to verify / harden the implementation, organized by category and estimated effort.
 
-**Last updated: 2026-04-26** (after merging PRs #1-#3 from lukeburns)
+**Last updated: 2026-04-27**
+
+**See also:** sibling repo `hyperswarm-cpp/docs/REMAINING-WORK.md` section **CPP
+`example` / NAT — manual re-test** for two-process `example.cpp` runs, which
+logs to grep (`rawStream firewall`, holepunch, `on_socket` paths in
+`src/server.cpp`).
 
 ---
 
