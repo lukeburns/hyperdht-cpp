@@ -149,7 +149,12 @@ struct PendingHandshake {
     // two responders that both think they are mid-handshake at msg1,
     // producing two different ephemeral keys on `send()` — a
     // protocol-level split-brain. Enforce at compile time.
-    PendingHandshake() = default;
+    //
+    // The default ctor is = delete (not = default): noise::NoiseIK has
+    // no default ctor, which makes a defaulted PendingHandshake() an
+    // implicitly-deleted function — clang flags this as
+    // -Wdefaulted-function-deleted. = delete makes the intent explicit.
+    PendingHandshake() = delete;
     PendingHandshake(noise::NoiseIK ik, noise::PubKey pk,
                      peer_connect::NoisePayload pl)
         : noise_ik(std::move(ik)),
