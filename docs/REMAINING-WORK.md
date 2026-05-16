@@ -2,12 +2,49 @@
 
 Tasks to verify / harden the implementation, organized by category and estimated effort.
 
-**Last updated: 2026-04-27**
+**Last updated: 2026-05-16**
 
 **See also:** sibling repo `hyperswarm-cpp/docs/REMAINING-WORK.md` section **CPP
 `example` / NAT — manual re-test** for two-process `example.cpp` runs, which
 logs to grep (`rawStream firewall`, holepunch, `on_socket` paths in
 `src/server.cpp`).
+
+---
+
+## Known-issue: destroy(force=true) does not reap in-flight async state
+
+Surfaced by hyperswarm-cpp ASan CI (test `HyperswarmCAPI.JoinAndLeavePeerOffline`).
+On an offline connect path, `HyperDHT::destroy(force=true)` does not reap
+the in-flight `ConnState` + noise payload allocated in
+`src/connect.cpp:314 / 351 / 421` (~2.8KB total). Today `destroy()` only
+explicitly clears `bootstrap_query_` and `refresh_queries_` and stops the
+interface watcher; everything else that holds async state is left to its
+natural completion path, which never fires when offline.
+
+**Scope of fix.** Audit `HyperDHT::destroy(force=true)` for every source of
+in-flight async state and cancel + drop on `force=true`:
+
+- [ ] **Connect sessions** — `do_connect` allocations (the witness above).
+- [ ] **Server pending-handshakes** — `PendingHandshake` map / outstanding
+      `decode_handshake` results.
+- [ ] **Holepunch state** — `Puncher` instances created during connect probes.
+- [ ] **Socket pool** — `SocketPool` entries past their close.
+- [ ] **Connection pool** — `ConnectionPool` entries.
+- [ ] **Outstanding queries** beyond `bootstrap_query_` / `refresh_queries_`
+      (anything in the `rpc::Session` family).
+- [ ] **Router relay sessions** — `relay_through` / `PEER_HANDSHAKE` relay state.
+
+**Already-accepted leak.** The `udx_interface_event_t` leak in
+`src/dht_network.cpp:308-314` is a *different*, documented trade-off and
+should stay as-is (suppressed downstream via hyperswarm-cpp's
+`.lsan-suppressions.txt`).
+
+**Related.** `RpcSocket::~RpcSocket` async-close UAF surfaced by
+hyperswarm-cpp testnet ASan is in the same family (in-flight state
+outlives `destroy`).
+
+**Downstream impact.** Until this lands, hyperswarm-cpp's ASan CI step is
+`continue-on-error: true`; the regular Debug suite still gates merges.
 
 ---
 
