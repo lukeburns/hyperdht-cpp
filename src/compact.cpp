@@ -1,6 +1,8 @@
 // compact-encoding implementation — varints, fixed-width ints,
 // raw/length-prefixed buffers, IPv4/IPv6 (compact-encoding-net).
 // Matches the JS reference wire format byte-for-byte.
+//
+// Buffer::decode capped at 64KB to prevent allocation attacks.
 
 #include "hyperdht/compact.hpp"
 
@@ -235,6 +237,8 @@ Buffer::DecodeResult Buffer::decode(State& s) {
     auto len = Uint::decode(s);
     if (s.error) return {};
     if (len == 0) return {};  // null
+    constexpr size_t MAX_BUFFER_DECODE = 65536;  // H12: cap allocation size
+    if (len > MAX_BUFFER_DECODE) { s.error = true; return {}; }
     if (!has_bytes(s, static_cast<size_t>(len))) { s.error = true; return {}; }
     const uint8_t* ptr = s.data() + s.start;
     s.start += static_cast<size_t>(len);
@@ -419,10 +423,12 @@ Ipv6Address Ipv6Address::from_string(const std::string& host_str, uint16_t port)
     }
 
     // Parse colon-separated hex groups from a string
-    auto parse_groups = [](const std::string& s, std::vector<uint16_t>& out) {
+    // M1: parse hex groups with validation — returns false on non-hex input
+    bool parse_ok = true;
+    auto parse_groups = [&parse_ok](const std::string& s, std::vector<uint16_t>& out) {
         if (s.empty()) return;
         size_t pos = 0;
-        while (pos <= s.size()) {
+        while (pos < s.size()) {
             size_t colon = s.find(':', pos);
             if (colon == std::string::npos) colon = s.size();
             uint16_t val = 0;
@@ -431,6 +437,7 @@ Ipv6Address Ipv6Address::from_string(const std::string& host_str, uint16_t port)
                 if (c >= '0' && c <= '9') val = val * 16 + (c - '0');
                 else if (c >= 'a' && c <= 'f') val = val * 16 + (c - 'a' + 10);
                 else if (c >= 'A' && c <= 'F') val = val * 16 + (c - 'A' + 10);
+                else { parse_ok = false; return; }
             }
             out.push_back(val);
             pos = colon + 1;
@@ -440,6 +447,7 @@ Ipv6Address Ipv6Address::from_string(const std::string& host_str, uint16_t port)
     if (found_double_colon) {
         parse_groups(before_str, before_groups);
         parse_groups(after_str, after_groups);
+        if (!parse_ok) return addr;  // M1: invalid hex
         // Fill in zeros between before and after to make 8 groups
         size_t total = before_groups.size() + after_groups.size();
         size_t missing = (total < 8) ? (8 - total) : 0;
@@ -453,6 +461,7 @@ Ipv6Address Ipv6Address::from_string(const std::string& host_str, uint16_t port)
         }
     } else {
         parse_groups(before_str, before_groups);
+        if (!parse_ok) return addr;  // M1: invalid hex
         for (size_t g = 0; g < 8 && g < before_groups.size(); g++) {
             addr.host[g * 2] = static_cast<uint8_t>(before_groups[g] >> 8);
             addr.host[g * 2 + 1] = static_cast<uint8_t>(before_groups[g] & 0xff);

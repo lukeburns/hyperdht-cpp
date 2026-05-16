@@ -5,6 +5,9 @@
 //
 // JS reference: blind-relay/index.js
 // See blind_relay.hpp for architecture overview.
+//
+// Resource limits: pairings_ map capped at 1024 entries (on_pair).
+// Session destructor guards channel_ dereference against Mux teardown.
 
 #include "hyperdht/blind_relay.hpp"
 
@@ -347,6 +350,17 @@ void BlindRelayServer::close() {
 }
 
 BlindRelayServer::RelayPair& BlindRelayServer::get_or_create_pair(const Token& token) {
+    // H25: evict stale unpaired entries (>30s) on each new pair attempt
+    constexpr auto PAIRING_TTL = std::chrono::seconds(30);
+    auto now = std::chrono::steady_clock::now();
+    for (auto it = pairings_.begin(); it != pairings_.end(); ) {
+        if (!it->second.paired() && (now - it->second.created_at) > PAIRING_TTL) {
+            it = pairings_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
     auto key = token_hex(token);
     auto it = pairings_.find(key);
     if (it != pairings_.end()) return it->second;
@@ -411,9 +425,11 @@ BlindRelaySession::BlindRelaySession(BlindRelayServer& server,
 BlindRelaySession::~BlindRelaySession() {
     // Invalidate sentinel so pending callbacks become no-ops
     alive_.reset();
-    // Clear channel callbacks to break ref cycles
-    channel_->on_close = nullptr;
-    channel_->on_destroy = nullptr;
+    // H7: guard against dangling channel_ (may have been destroyed by Mux teardown)
+    if (!destroyed_ && channel_) {
+        channel_->on_close = nullptr;
+        channel_->on_destroy = nullptr;
+    }
     // Clean up relay streams if not closed via channel close
     for (auto& [key, stream] : streams_) {
         if (stream) {
@@ -454,6 +470,12 @@ void BlindRelaySession::on_pair(const uint8_t* data, size_t len) {
     DHT_LOG("  [blind-relay-session] Pair request: initiator=%d, token=%s, id=%u\n",
             msg.is_initiator, key.substr(0, 8).c_str(), msg.id);
 
+    // H25: reject if too many unpaired entries to prevent DoS
+    constexpr size_t MAX_PAIRINGS = 1024;
+    if (server_.pairing_count() >= MAX_PAIRINGS) {
+        auto existing_key = token_hex(msg.token);
+        if (!server_.has_pair(existing_key)) return;
+    }
     auto& pair = server_.get_or_create_pair(msg.token);
 
     // Check if this initiator slot is already taken

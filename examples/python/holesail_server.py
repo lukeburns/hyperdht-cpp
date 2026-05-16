@@ -262,6 +262,7 @@ def main() -> None:
 
     # Create server with optional firewall
     server = dht.create_server()
+    server.set_reusable_socket(True)  # skip holepunch on reconnect from same peer
 
     if args.secure:
         server.set_firewall(
@@ -289,6 +290,8 @@ def main() -> None:
         bridge = Bridge(tcp_sock, None, dht, bridges)
         bridges.add(bridge)
 
+        conn_id = connection_count
+
         def on_open() -> None:
             bridge.activate()
 
@@ -296,6 +299,7 @@ def main() -> None:
             bridge.write_to_tcp(data)
 
         def on_close() -> None:
+            print(f"  Stream closed  [{conn_id}]")
             bridge.close()
 
         stream = dht.open_stream(
@@ -337,18 +341,39 @@ def main() -> None:
   Ctrl+C to stop
 """)
 
+    # Diagnostic heartbeat — print DHT state every 30s
+    import time
+    last_heartbeat = [time.monotonic()]
+
+    orig_run = dht.run
+
+    def run_with_heartbeat():
+        while True:
+            dht.run(mode="once")
+            now = time.monotonic()
+            if now - last_heartbeat[0] >= 30:
+                last_heartbeat[0] = now
+                addr = dht.remote_address
+                addr_str = f"{addr.host}:{addr.port}" if addr else "unknown"
+                print(f"  [heartbeat] online={dht.is_online} "
+                      f"persistent={dht.is_persistent} "
+                      f"listening={server.is_listening} "
+                      f"addr={addr_str} "
+                      f"bridges={len(bridges)} "
+                      f"conns={connection_count}")
+
     # Event-driven: TCP sockets are registered with libuv via poll_start,
     # so dht.run() handles everything — DHT, streams, and TCP bridging.
-    # Uses UV_RUN_ONCE loop internally so Ctrl+C is handled properly.
     try:
-        dht.run()
+        run_with_heartbeat()
     except KeyboardInterrupt:
         pass
 
     print(f"\n  Shutting down ({connection_count} connections served)")
     for bridge in list(bridges):
         bridge.close()
-    dht.destroy()
+    server.close_force()  # skip UNANNOUNCE — exit fast
+    dht.destroy(force=True)
 
 
 if __name__ == "__main__":

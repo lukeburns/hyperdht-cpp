@@ -60,6 +60,22 @@ class HyperDHT(
 
     val port: Int get() = Native.port(handle)
 
+    /**
+     * UDP file descriptors backing the DHT's two internal sockets, or -1
+     * if not bound (or on Windows).  Intended for `VpnService.protect(int)`
+     * on Android — without protecting, a HyperDHT instance created after
+     * a VpnService.Builder.establish() gets its UDP sockets steered into
+     * the VPN's routing rules and holepunch breaks.
+     *
+     * For an ephemeral / firewalled node (e.g. a phone client), the
+     * outbound socket that actually carries DHT traffic is
+     * [clientSocketFd]; protect() that one.  Protecting both is cheap
+     * and future-proof if the node ever transitions out of firewalled
+     * state (in which case it switches to [serverSocketFd]).
+     */
+    val clientSocketFd: Int get() = Native.clientSocketFd(handle)
+    val serverSocketFd: Int get() = Native.serverSocketFd(handle)
+
     // --- Lifecycle ---
 
     fun start(): Job {
@@ -68,8 +84,14 @@ class HyperDHT(
             while (isActive && !destroyed) {
                 Native.loopRunOnce(loopHandle)
                 // Yield lets other tasks queued on this thread execute
-                // (connect, write, etc.) before the next uv_run iteration
+                // (connect, write, etc.) before the next uv_run iteration.
                 yield()
+                // Flush: tasks executed during yield() may have queued
+                // deferred libuv work (e.g. UDX's uv_prepare for packet
+                // sends).  A non-blocking run processes those callbacks
+                // so the data hits the wire BEFORE the next blocking poll,
+                // preventing a full round-trip delay on the echo path.
+                Native.loopRunNowait(loopHandle)
             }
         }
         return loopJob!!

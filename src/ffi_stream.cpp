@@ -1,5 +1,9 @@
 // FFI stream: encrypted stream open/write/close, file-descriptor polling.
+//
+// Safety: drain callbacks use shared_ptr<bool> closed_flag (survives stream
+// deletion). uv_ip4_addr return value is checked. Zero-event polls rejected.
 #include "ffi_internal.hpp"
+#include "hyperdht/debug.hpp"
 
 // ---------------------------------------------------------------------------
 // Encrypted streams — delegates to SecretStreamDuplex (see ffi_internal.hpp
@@ -15,6 +19,12 @@ hyperdht_stream_t* hyperdht_stream_open(
     void* userdata) {
 
     if (!dht || !dht->dht || !conn) return nullptr;
+
+    DHT_LOG("  [ffi-stream] stream_open: peer=%s:%u raw_stream=%p udx_socket=%p "
+            "initiator=%d remote_udx_id=%u local_udx_id=%u\n",
+            conn->peer_host, conn->peer_port, conn->raw_stream,
+            conn->udx_socket, conn->is_initiator,
+            conn->remote_udx_id, conn->local_udx_id);
 
     // ---- 1. Obtain a heap-allocated raw UDX stream ----
     udx_stream_t* raw = nullptr;
@@ -40,12 +50,25 @@ hyperdht_stream_t* hyperdht_stream_open(
 
         if (conn->peer_port != 0) {
             struct sockaddr_in dest{};
-            uv_ip4_addr(conn->peer_host, conn->peer_port, &dest);
+            int rc = uv_ip4_addr(conn->peer_host, conn->peer_port, &dest);
+            if (rc != 0) {  // H19: invalid address
+                udx_stream_destroy(raw);
+                return nullptr;
+            }
             // Use the holepunch-discovered socket when available — it has
             // the correct NAT mapping. Fall back to the main RPC socket.
             udx_socket_t* sock = conn->udx_socket
                 ? static_cast<udx_socket_t*>(conn->udx_socket)
                 : dht->dht->socket().socket_handle();
+
+            // Debug: identify which socket is being used
+            struct sockaddr_in sock_addr{};
+            int sock_len = sizeof(sock_addr);
+            udx_socket_getsockname(sock, reinterpret_cast<struct sockaddr*>(&sock_addr), &sock_len);
+            DHT_LOG("  [ffi-stream] stream connecting via %s socket (port %u) → %s:%u\n",
+                    conn->udx_socket ? "holepunch" : "server_socket",
+                    ntohs(sock_addr.sin_port), conn->peer_host, conn->peer_port);
+
             udx_stream_connect(raw, sock,
                                conn->remote_udx_id,
                                reinterpret_cast<const struct sockaddr*>(&dest));
@@ -128,10 +151,12 @@ hyperdht_stream_t* hyperdht_stream_open(
 
     // ---- 4. Install event callbacks ----
     s->duplex->on_connect([s]() {
+        DHT_LOG("  [ffi-stream] SecretStream header exchange COMPLETE (on_connect)\n");
         // The header exchange is complete; the encrypted channel is up.
         if (s->on_open) s->on_open(s->userdata);
     });
     s->duplex->on_message([s](const uint8_t* data, size_t len) {
+        DHT_LOG("  [ffi-stream] on_message: %zu bytes (closed=%d)\n", len, s->closed ? 1 : 0);
         if (s->on_data) s->on_data(data, len, s->userdata);
     });
     s->duplex->on_udp_message([s](const uint8_t* data, size_t len) {
@@ -144,16 +169,21 @@ hyperdht_stream_t* hyperdht_stream_open(
         }
     });
     s->duplex->on_end([s]() {
+        DHT_LOG("  [ffi-stream] on_end: peer half-closed\n");
         // Peer signalled half-close; begin our own teardown so on_close
         // fires for the user. `end()` is idempotent.
         if (s->duplex) s->duplex->end();
     });
-    s->duplex->on_close([s](int /*err*/) {
+    s->duplex->on_close([s](int err) {
+        DHT_LOG("  [ffi-stream] on_close: err=%d\n", err);
         stream_fire_close(s);
     });
 
     // ---- 5. Fire off the header exchange ----
+    DHT_LOG("  [ffi-stream] starting SecretStream header exchange (initiator=%d)\n",
+            hs.is_initiator ? 1 : 0);
     s->duplex->start();
+    DHT_LOG("  [ffi-stream] stream_open returning stream=%p\n", s);
     return s;
 }
 
@@ -173,10 +203,11 @@ int hyperdht_stream_write_with_drain(hyperdht_stream_t* stream,
     if (!on_drain) {
         return stream->duplex->write(data, len, nullptr);
     }
+    // H18: capture shared closed_flag — survives stream deletion
+    auto closed_flag = stream->closed_flag;
     return stream->duplex->write(data, len,
-        [stream, on_drain, userdata](int /*status*/) {
-            // Guard: stream may have been closed between write and drain.
-            if (stream->closed) return;
+        [closed_flag, stream, on_drain, userdata](int /*status*/) {
+            if (*closed_flag) return;
             on_drain(stream, userdata);
         });
 }
@@ -257,6 +288,8 @@ hyperdht_poll_t* hyperdht_poll_start(hyperdht_t* dht,
     int uv_events = 0;
     if (events & HYPERDHT_POLL_READABLE) uv_events |= UV_READABLE;
     if (events & HYPERDHT_POLL_WRITABLE) uv_events |= UV_WRITABLE;
+    // M16: reject zero events — would create zombie poll handle
+    if (uv_events == 0) { delete p; return nullptr; }
 
     if (uv_poll_start(&p->handle, uv_events, on_poll) != 0) {
         uv_close(reinterpret_cast<uv_handle_t*>(&p->handle),

@@ -1,6 +1,8 @@
 // PEER_HANDSHAKE implementation — sends the initiator Noise msg1 to a
 // relay DHT node, awaits the responder msg2, and produces a handshake
 // result (keys, hash, encrypted payload) for the holepunch stage.
+//
+// Input validation: relay_count in NoisePayload capped at 128.
 
 #include "hyperdht/peer_connect.hpp"
 
@@ -170,6 +172,7 @@ NoisePayload decode_noise_payload(const uint8_t* data, size_t len) {
         if (state.error) return p;
         auto relay_count = static_cast<uint32_t>(Uint::decode(state));
         if (state.error) return p;
+        if (relay_count > 128) { state.error = true; return p; }  // C4: cap relay count
         for (uint32_t i = 0; i < relay_count && !state.error; i++) {
             RelayInfo ri;
             ri.relay_address = Ipv4Addr::decode(state);
@@ -388,6 +391,12 @@ void peer_handshake(rpc::RpcSocket& socket,
             result.rx_key = noise_ik->rx_key();
             result.handshake_hash = noise_ik->handshake_hash();
             result.remote_public_key = remote_pubkey;
+            // JS `router.js:46-78`: serverAddress = hs.peerAddress || to.
+            // The relay's observation of where the server replied from —
+            // the fresh address. Used downstream as Round 1's
+            // `remote_address` field which triggers the server's
+            // fast-mode punch (server.js:530-538).
+            result.server_address = hs_resp.peer_address;
 
             on_done(result);
         },
@@ -467,6 +476,8 @@ void peer_handshake(rpc::RpcSocket& socket,
             result.rx_key = noise_ik->rx_key();
             result.handshake_hash = noise_ik->handshake_hash();
             result.remote_public_key = remote_pubkey;
+            // JS `router.js:46-78`: serverAddress = hs.peerAddress || to.
+            result.server_address = hs_resp.peer_address;
             on_done(result);
         },
         [noise_ik, on_done](uint16_t) {

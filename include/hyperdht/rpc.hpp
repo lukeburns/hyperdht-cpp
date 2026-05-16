@@ -221,10 +221,27 @@ public:
     udx_t* udx_handle() { return &udx_; }
     // Always returns server socket — UDX streams use the persistent port.
     // Matches JS: index.js:139 where dht.socket returns serverSocket.
-    udx_socket_t* socket_handle() { return &server_socket_; }
+    // EMBEDDED (ESP32): single-socket build, returns the only socket.
+    udx_socket_t* socket_handle() {
+#ifdef HYPERDHT_EMBEDDED
+        return &client_socket_;
+#else
+        return &server_socket_;
+#endif
+    }
+    // Ephemeral outbound socket (random port). Used for DHT lookups and
+    // connect()/holepunch on a firewalled / ephemeral node.
+    udx_socket_t* client_socket_handle() { return &client_socket_; }
 
-    // Returns the currently active socket (client while firewalled, server after)
-    udx_socket_t* active_socket() { return firewalled_ ? &client_socket_ : &server_socket_; }
+    // Returns the currently active socket (client while firewalled, server after).
+    // EMBEDDED: always the single client_socket_; node never goes persistent.
+    udx_socket_t* active_socket() {
+#ifdef HYPERDHT_EMBEDDED
+        return &client_socket_;
+#else
+        return firewalled_ ? &client_socket_ : &server_socket_;
+#endif
+    }
 
     // Close the socket and stop all timers
     void close();
@@ -278,8 +295,12 @@ public:
         if (on_health_change_) on_health_change_();
     }
 
-    // Get adaptive timeout for a peer (returns DEFAULT_TIMEOUT_MS if unknown)
+    // Adaptive timeout: get / record per-peer RTT samples.
+    // PoolSocket (holepunch.cpp) reuses the same EMA so its RPC retries
+    // adapt to the same network conditions the main RPC sees, matching
+    // JS dht-rpc's shared `_adt` adaptive-timeout map (io.js:78,116-118,458).
     uint64_t timeout_for(const compact::Ipv4Address& peer) const;
+    void record_rtt(const compact::Ipv4Address& peer, uint64_t rtt_ms);
 
     // Access internals for testing
     const routing::RoutingTable& table() const { return table_; }
@@ -437,9 +458,6 @@ private:
     void udp_send_on(const std::vector<uint8_t>& buf,
                      const compact::Ipv4Address& to,
                      udx_socket_t* socket);
-
-    // Adaptive timeout: record RTT sample
-    void record_rtt(const compact::Ipv4Address& peer, uint64_t rtt_ms);
 
     // UDP receive callbacks — one per socket
     static void on_recv_client(udx_socket_t* socket, ssize_t nread, const uv_buf_t* buf,

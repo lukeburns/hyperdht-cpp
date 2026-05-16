@@ -58,13 +58,26 @@
 struct uv_loop_s;
 typedef struct uv_loop_s uv_loop_t;
 
-/* Symbol visibility for shared library builds */
-#if defined(HYPERDHT_SHARED) && defined(__GNUC__)
-#define HYPERDHT_API __attribute__((visibility("default")))
-#elif defined(HYPERDHT_SHARED) && defined(_MSC_VER)
-#define HYPERDHT_API __declspec(dllexport)
+/* Symbol visibility for shared library builds.
+ *
+ * HYPERDHT_SHARED → set when the library is built/consumed as a DLL/.so/.dylib
+ *                    (CMake propagates this via target INTERFACE).
+ * HYPERDHT_BUILD  → set only while compiling the library itself (PRIVATE).
+ *
+ * On Windows, exports differ between build (dllexport) and consumption
+ * (dllimport). Elsewhere, GCC/Clang use the same default-visibility attribute
+ * for both sides and only emit it when actually building shared.
+ */
+#if defined(_WIN32) && defined(HYPERDHT_SHARED)
+#  if defined(HYPERDHT_BUILD)
+#    define HYPERDHT_API __declspec(dllexport)
+#  else
+#    define HYPERDHT_API __declspec(dllimport)
+#  endif
+#elif defined(HYPERDHT_SHARED) && (defined(__GNUC__) || defined(__clang__))
+#  define HYPERDHT_API __attribute__((visibility("default")))
 #else
-#define HYPERDHT_API
+#  define HYPERDHT_API
 #endif
 
 #ifdef __cplusplus
@@ -225,6 +238,10 @@ HYPERDHT_API void hyperdht_keypair_generate(hyperdht_keypair_t* out);
 /** Generate a keypair from a 32-byte seed (deterministic). */
 HYPERDHT_API void hyperdht_keypair_from_seed(hyperdht_keypair_t* out, const uint8_t seed[32]);
 
+/** Zero the secret key material in a keypair. Call when the keypair is no
+ *  longer needed to prevent secret key recovery from process memory. */
+HYPERDHT_API void hyperdht_keypair_zero(hyperdht_keypair_t* kp);
+
 /* =========================================================================
  * Lifecycle
  * ========================================================================= */
@@ -259,6 +276,31 @@ HYPERDHT_API int hyperdht_bind(hyperdht_t* dht, uint16_t port);
 /** Get the bound port (0 if not bound). */
 HYPERDHT_API uint16_t hyperdht_port(const hyperdht_t* dht);
 
+/**
+ * Return the underlying UDP socket file descriptors (libuv-managed),
+ * or -1 if not bound or unavailable.
+ *
+ * The DHT keeps two sockets:
+ *   - `client_socket`: ephemeral outbound (random port).  Used for
+ *     DHT lookups and connect()/holepunch from a firewalled or
+ *     ephemeral node — i.e. the socket that traffic flows through
+ *     for a typical mobile/desktop client.
+ *   - `server_socket`: persistent (user-specified port or 0).  Used
+ *     once the node is determined to be non-firewalled, and for
+ *     incoming UDX streams when running as a server.
+ *
+ * Exposed primarily for Android VpnService.protect(int) — VPN
+ * applications need the actual UDP fds to mark the DHT's sockets as
+ * bypassing the VPN tunnel, otherwise new sockets created after
+ * `establish()` get steered into the VPN's routing rules and
+ * holepunch fails.
+ *
+ * POSIX-only.  On Windows uv_os_fd_t is HANDLE; these accessors
+ * return -1 there.
+ */
+HYPERDHT_API int hyperdht_client_socket_fd(const hyperdht_t* dht);
+HYPERDHT_API int hyperdht_server_socket_fd(const hyperdht_t* dht);
+
 /** Check if the instance has been destroyed. */
 HYPERDHT_API int hyperdht_is_destroyed(const hyperdht_t* dht);
 
@@ -267,7 +309,23 @@ HYPERDHT_API int hyperdht_is_destroyed(const hyperdht_t* dht);
  * After calling this, you MUST:
  *   1. Call uv_run() to drain pending close callbacks
  *   2. Call hyperdht_free() to release memory
- * @param cb      optional callback when destruction starts
+ *
+ * WARNING — CALLBACK FIRES BEFORE DRAIN:
+ *   The callback fires synchronously to signal that teardown has been
+ *   scheduled — NOT that it is complete. libuv close handles are still
+ *   pending when cb runs. Do NOT call hyperdht_free() inside cb — the
+ *   object is still alive and referenced by libuv. The correct pattern:
+ *
+ *     hyperdht_destroy(dht, my_cb, NULL);   // schedules teardown, fires cb
+ *     uv_run(&loop, UV_RUN_DEFAULT);        // drains all close callbacks
+ *     hyperdht_free(dht);                   // NOW safe to free
+ *
+ * BLOCKING: This function and the subsequent uv_run() drain may block
+ * for several seconds while libuv close callbacks complete. On mobile
+ * platforms (Android/iOS), never call this from the UI/main thread —
+ * it will freeze the screen. Use a background thread or dispatch queue.
+ *
+ * @param cb      optional callback, fires synchronously (teardown scheduled)
  * @param userdata passed to cb
  */
 HYPERDHT_API void hyperdht_destroy(hyperdht_t* dht, hyperdht_close_cb cb, void* userdata);
@@ -776,8 +834,8 @@ HYPERDHT_API void hyperdht_resume_logged(hyperdht_t* dht,
  * spending a round-trip to the network isn't worth the delay. Matches
  * JS `dht.destroy({ force: true })`.
  *
- * Otherwise identical to `hyperdht_destroy` — caller still needs to
- * run the event loop to drain close callbacks, then call `hyperdht_free`.
+ * Otherwise identical to `hyperdht_destroy` — same callback-before-drain
+ * warning applies. Caller still needs uv_run() then hyperdht_free().
  */
 HYPERDHT_API void hyperdht_destroy_force(hyperdht_t* dht,
                                          hyperdht_close_cb cb,
@@ -940,6 +998,11 @@ HYPERDHT_API void hyperdht_server_set_firewall_async(hyperdht_server_t* srv,
 
 /* ── Phase E: Blind Relay ─────────────────────────────────────────────── */
 
+/** Enable reusable socket — lets clients cache the UDX route after the first
+ *  connection and skip holepunch on reconnect. Essential for web apps behind
+ *  NAT. JS default: false; holesail sets true. */
+HYPERDHT_API void hyperdht_server_set_reusable_socket(hyperdht_server_t* srv, int enabled);
+
 /** Set relay-through public key on a server (enables blind relay fallback).
  *  relay_pk: 32-byte public key of the relay node, or NULL to disable.
  *  keep_alive_ms: keep-alive for relay connection (default 5000). */
@@ -948,14 +1011,16 @@ HYPERDHT_API void hyperdht_server_set_relay_through(hyperdht_server_t* srv,
                                                      uint64_t keep_alive_ms);
 
 /** Connect with relay-through option.
+ *  remote_pk: MUST point to exactly 32 bytes (Ed25519 public key).
  *  relay_pk: 32-byte public key of relay node, or NULL (no relay).
- *  relay_keep_alive_ms: keep-alive for relay socket (default 5000). */
-HYPERDHT_API void hyperdht_connect_relay(hyperdht_t* dht,
-                                          const uint8_t* remote_pk,
-                                          const uint8_t* relay_pk,
-                                          uint64_t relay_keep_alive_ms,
-                                          hyperdht_connect_cb cb,
-                                          void* userdata);
+ *  relay_keep_alive_ms: keep-alive for relay socket (default 5000).
+ *  Returns 0 on success, -1 on invalid arguments (cb is fired with error). */
+HYPERDHT_API int hyperdht_connect_relay(hyperdht_t* dht,
+                                         const uint8_t* remote_pk,
+                                         const uint8_t* relay_pk,
+                                         uint64_t relay_keep_alive_ms,
+                                         hyperdht_connect_cb cb,
+                                         void* userdata);
 
 /** Get relay stats. */
 HYPERDHT_API int hyperdht_relay_stats_attempts(hyperdht_t* dht);

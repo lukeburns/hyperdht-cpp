@@ -48,6 +48,7 @@ void hyperdht_keypair_generate(hyperdht_keypair_t* out) {
     auto kp = hyperdht::noise::generate_keypair();
     memcpy(out->public_key, kp.public_key.data(), 32);
     memcpy(out->secret_key, kp.secret_key.data(), 64);
+    sodium_memzero(kp.secret_key.data(), 64);  // C10: zero stack copy
 }
 
 void hyperdht_keypair_from_seed(hyperdht_keypair_t* out, const uint8_t seed[32]) {
@@ -57,6 +58,14 @@ void hyperdht_keypair_from_seed(hyperdht_keypair_t* out, const uint8_t seed[32])
     auto kp = hyperdht::noise::generate_keypair(s);
     memcpy(out->public_key, kp.public_key.data(), 32);
     memcpy(out->secret_key, kp.secret_key.data(), 64);
+    sodium_memzero(s.data(), 32);              // C10: zero seed
+    sodium_memzero(kp.secret_key.data(), 64);  // C10: zero stack copy
+}
+
+void hyperdht_keypair_zero(hyperdht_keypair_t* kp) {
+    if (!kp) return;
+    sodium_memzero(kp->secret_key, 64);
+    sodium_memzero(kp->public_key, 32);
 }
 
 // ---------------------------------------------------------------------------
@@ -130,11 +139,8 @@ hyperdht_t* hyperdht_create(uv_loop_t* loop, const hyperdht_opts_t* opts) {
 
 int hyperdht_bind(hyperdht_t* dht, uint16_t port) {
     if (!dht || !dht->dht) return -1;
-    // Port 0 uses the port from DhtOptions (or ephemeral)
-    // Non-zero port overrides DhtOptions
     if (port != 0) {
-        // TODO: forward port to bind — currently HyperDHT::bind() uses opts_.port
-        // For now, this is a known limitation: port must be set via opts at creation
+        dht->dht->set_port(port);
     }
     return dht->dht->bind();
 }
@@ -142,6 +148,35 @@ int hyperdht_bind(hyperdht_t* dht, uint16_t port) {
 uint16_t hyperdht_port(const hyperdht_t* dht) {
     if (!dht || !dht->dht) return 0;
     return dht->dht->port();
+}
+
+namespace {
+int udp_socket_fd(udx_socket_t* s) {
+    if (!s) return -1;
+    // udx_socket_t starts with `uv_udp_t uv_udp` (deps/libudx/include/udx.h).
+    // uv_os_fd_t is `int` on POSIX (Android/Linux/macOS) and HANDLE on Windows;
+    // VpnService.protect()/SO_BINDTODEVICE-style use cases only make sense on
+    // POSIX, so we return -1 on Windows.
+#ifndef _WIN32
+    uv_os_fd_t fd = -1;
+    if (uv_fileno(reinterpret_cast<uv_handle_t*>(&s->uv_udp), &fd) != 0)
+        return -1;
+    return static_cast<int>(fd);
+#else
+    (void)s;
+    return -1;
+#endif
+}
+}  // namespace
+
+int hyperdht_client_socket_fd(const hyperdht_t* dht) {
+    if (!dht || !dht->dht) return -1;
+    return udp_socket_fd(dht->dht->socket().client_socket_handle());
+}
+
+int hyperdht_server_socket_fd(const hyperdht_t* dht) {
+    if (!dht || !dht->dht) return -1;
+    return udp_socket_fd(dht->dht->socket().socket_handle());
 }
 
 int hyperdht_is_destroyed(const hyperdht_t* dht) {
@@ -236,7 +271,8 @@ int hyperdht_connect_ex(hyperdht_t* dht,
             hyperdht::noise::Keypair kp;
             std::memcpy(kp.public_key.data(), opts->keypair->public_key, 32);
             std::memcpy(kp.secret_key.data(), opts->keypair->secret_key, 64);
-            cpp_opts.keypair = std::move(kp);
+            cpp_opts.keypair = kp;
+            sodium_memzero(kp.secret_key.data(), 64);  // C10
         }
         if (opts->relay_through) {
             hyperdht::noise::PubKey rpk{};

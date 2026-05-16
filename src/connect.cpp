@@ -225,12 +225,26 @@ static void fire_handshake(std::shared_ptr<ConnState> state,
         [state, relay_addr](const peer_connect::HandshakeResult& hs) {
             state->handshakes_in_flight--;
             if (state->completed) return;  // First-success or destruction guard
+            // If a sibling handshake already won, drop ours silently.
+            // The pool socket from this contestant will be torn down when
+            // PunchState would've been built — but we never start a punch
+            // here, so no NAT mapping is created. JS parity: the sibling
+            // connectThroughNode promises also "win" but their c.connect
+            // is already set so nothing meaningful happens past handshake.
+            if (state->hs_result.success) {
+                try_next_relay(state);  // bails immediately on the new guard
+                return;
+            }
             if (state->alive.expired() || !hs.success) {
                 try_next_relay(state);
                 return;
             }
             state->relay_addr = relay_addr;
             state->hs_result = hs;
+            // Stop the findPeer query — no more contestants needed.
+            // JS connect.js:354 break-out equivalent.
+            if (state->query) state->query.reset();
+            state->pending_relays.clear();
             on_handshake_success(state, hs);
         });
 }
@@ -255,6 +269,14 @@ static void check_exhaustion(std::shared_ptr<ConnState> state) {
 // ---------------------------------------------------------------------------
 static void try_next_relay(std::shared_ptr<ConnState> state) {
     if (state->completed) return;
+    // JS connect.js:354 — stop dispatching once a handshake has already
+    // produced a connect context. Each extra handshake spawns its own
+    // PoolSocket with a fresh NAT mapping, and on carrier-grade NATs
+    // those sibling mappings starve the one the server is trying to
+    // punch back to. Match JS: one handshake wins, the rest are
+    // abandoned (and the in-flight ones become silent no-ops via
+    // hs_result.success guards in on_handshake_success).
+    if (state->hs_result.success) return;
     while (!state->pending_relays.empty() &&
            state->handshakes_in_flight < 2) {
         auto addr = state->pending_relays.front();
@@ -275,6 +297,18 @@ static void start_find_peer(std::shared_ptr<ConnState> state) {
         // on_reply: fire handshake as results stream in (pipelining)
         [state](const query::QueryReply& reply) {
             if (state->completed) return;
+            // JS connect.js:354 — break out of the for-await loop once
+            // c.connect is set (a handshake has produced its session
+            // context). We mirror that by short-circuiting on
+            // hs_result.success: one handshake wins, no new contestants
+            // get scheduled. Critical on CGNAT — multiple contestants
+            // mean multiple PoolSockets with different external NAT
+            // mappings, none of which match what the server's puncher
+            // probes back to.
+            if (state->hs_result.success) {
+                if (state->query) state->query.reset();
+                return;
+            }
             if (!reply.value.has_value() || reply.value->empty()) return;
             state->found = true;
             state->relays.push_back(reply.from_addr);
@@ -571,6 +605,9 @@ static void on_handshake_success(std::shared_ptr<ConnState> state,
     // Check for direct connect (OPEN firewall)
     holepunch::HolepunchResult hp_result;
     if (holepunch::try_direct_connect(hs, hp_result)) {
+        DHT_LOG("  [connect] *** DIRECT CONNECT (server OPEN) → %s:%u "
+                "(no holepunch, no pool socket) ***\n",
+                hp_result.address.host_string().c_str(), hp_result.address.port);
         ConnectResult result;
         result.success = true;
         result.tx_key = hs.tx_key;
@@ -592,6 +629,9 @@ static void on_handshake_success(std::shared_ptr<ConnState> state,
     if (!hs.remote_payload.holepunch.has_value() ||
         hs.remote_payload.holepunch->relays.empty()) {
         if (!hs.remote_payload.addresses4.empty()) {
+            DHT_LOG("  [connect] *** NO HOLEPUNCH INFO → direct connect to %s:%u ***\n",
+                    hs.remote_payload.addresses4[0].host_string().c_str(),
+                    hs.remote_payload.addresses4[0].port);
             ConnectResult result;
             result.success = true;
             result.tx_key = hs.tx_key;
@@ -613,9 +653,10 @@ static void on_handshake_success(std::shared_ptr<ConnState> state,
 
     auto& hp_info = *hs.remote_payload.holepunch;
 
-    // Use handshake relay if in holepunch relay list
+    // Use handshake relay if in holepunch relay list. The relay we just
+    // completed the handshake through is the right one for round 1/2.
     auto hp_relay = hp_info.relays[0].relay_address;
-    auto hp_peer = hp_info.relays[0].peer_address;
+    auto hp_peer = hp_info.relays[0].peer_address;  // announce-time fallback
     for (const auto& r : hp_info.relays) {
         if (r.relay_address.host_string() == state->relay_addr.host_string() &&
             r.relay_address.port == state->relay_addr.port) {
@@ -623,6 +664,16 @@ static void on_handshake_success(std::shared_ptr<ConnState> state,
             hp_peer = r.peer_address;
             break;
         }
+    }
+    // JS: c.connect.serverAddress = hs.peerAddress || to (router.js:46-78).
+    // Prefer the relay's *fresh* observation of the server's reply address
+    // over the *stale* announce-time `relays[i].peer_address`. Fresh is
+    // critical: JS server's fast-mode punch (server.js:530-538) only fires
+    // when the client's Round 1 `remoteAddress` matches one of the server's
+    // currently sampled NAT addresses. Announce-time addresses on CGNAT are
+    // typically stale by the time anyone connects.
+    if (hs.server_address.has_value()) {
+        hp_peer = *hs.server_address;
     }
 
     auto fw = state->socket->nat_sampler().firewall();
@@ -644,15 +695,34 @@ static void on_handshake_success(std::shared_ptr<ConnState> state,
     }
 
     // --- §6: localConnection LAN shortcut ------------------
-    // JS: connect.js:234-251 — same-NAT shortcut. See file header for details.
+    // JS: connect.js:234-251 — same-NAT shortcut.
+    //
+    // Two triggers:
+    //   A) Same public IP: our NAT sampler host matches the server's
+    //      first address (both behind the same NAT with public IPs).
+    //   B) Subnet match: the server advertises a private address on
+    //      the same subnet as one of our local interfaces (server has
+    //      no public IP yet, e.g. fw=UNKNOWN, but is on our LAN).
     {
         const bool relayed = !hs.remote_payload.addresses4.empty() &&
             (hs.remote_payload.addresses4[0] != state->relay_addr);
 
-        if (state->local_connection && relayed &&
+        // Check A: same public IP
+        bool same_nat = state->local_connection && relayed &&
             !state->socket->nat_sampler().host().empty() &&
             state->socket->nat_sampler().host() ==
-                hs.remote_payload.addresses4[0].host_string()) {
+                hs.remote_payload.addresses4[0].host_string();
+
+        // Check B: server has a private address on our subnet
+        bool same_subnet = false;
+        if (state->local_connection && relayed && !same_nat) {
+            auto my_local = holepunch::local_addresses(0);
+            auto subnet_match = holepunch::match_address(
+                my_local, hs.remote_payload.addresses4);
+            same_subnet = subnet_match.has_value();
+        }
+
+        if (same_nat || same_subnet) {
 
             auto my_local = holepunch::local_addresses(0);
             auto matched = holepunch::match_address(

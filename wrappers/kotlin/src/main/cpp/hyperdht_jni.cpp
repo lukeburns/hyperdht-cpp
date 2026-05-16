@@ -65,6 +65,15 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
     return JNI_VERSION_1_6;
 }
 
+// H16: track event callback global refs per DHT handle for cleanup in free().
+struct EventRefs {
+    jobject* bootstrapped = nullptr;
+    jobject* networkChange = nullptr;
+    jobject* networkUpdate = nullptr;
+    jobject* persistent = nullptr;
+};
+static std::unordered_map<jlong, EventRefs> g_event_refs;
+
 // ---------------------------------------------------------------------------
 // libuv loop
 // ---------------------------------------------------------------------------
@@ -93,6 +102,11 @@ Java_com_hyperdht_Native_loopRunOnce(JNIEnv*, jobject, jlong ptr) {
     if (verbose) LOGT("uv_run tick=%d done rc=%d", tick, rc);
 #endif
     return rc;
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_hyperdht_Native_loopRunNowait(JNIEnv*, jobject, jlong ptr) {
+    return uv_run((uv_loop_t*)ptr, UV_RUN_NOWAIT);
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -141,6 +155,7 @@ Java_com_hyperdht_Native_keypairGenerate(
     hyperdht_keypair_generate(&kp);
     env->SetByteArrayRegion(jpk, 0, 32, (jbyte*)kp.public_key);
     env->SetByteArrayRegion(jsk, 0, 64, (jbyte*)kp.secret_key);
+    hyperdht_keypair_zero(&kp);  // C10
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -153,6 +168,9 @@ Java_com_hyperdht_Native_keypairFromSeed(
     hyperdht_keypair_from_seed(&kp, seed);
     env->SetByteArrayRegion(jpk, 0, 32, (jbyte*)kp.public_key);
     env->SetByteArrayRegion(jsk, 0, 64, (jbyte*)kp.secret_key);
+    hyperdht_keypair_zero(&kp);              // C10
+    volatile uint8_t* vs = seed;             // C10: zero seed (no sodium.h in NDK)
+    for (size_t i = 0; i < 32; i++) vs[i] = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -170,7 +188,9 @@ Java_com_hyperdht_Native_create(
     opts.port = (uint16_t)port;
     opts.ephemeral = ephemeral ? 1 : 0;
     opts.use_public_bootstrap = usePublicBootstrap ? 1 : 0;
-    opts.connection_keep_alive = (uint32_t)connectionKeepAlive;
+    // M20: jint -1 means "use default" — map to 0 (C API default)
+    opts.connection_keep_alive = connectionKeepAlive < 0
+        ? 0 : static_cast<uint32_t>(connectionKeepAlive);
 
     if (jseed) {
         env->GetByteArrayRegion(jseed, 0, 32, (jbyte*)opts.seed);
@@ -197,6 +217,16 @@ Java_com_hyperdht_Native_port(JNIEnv*, jobject, jlong h) {
     return hyperdht_port((hyperdht_t*)h);
 }
 
+extern "C" JNIEXPORT jint JNICALL
+Java_com_hyperdht_Native_clientSocketFd(JNIEnv*, jobject, jlong h) {
+    return hyperdht_client_socket_fd((hyperdht_t*)h);
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_hyperdht_Native_serverSocketFd(JNIEnv*, jobject, jlong h) {
+    return hyperdht_server_socket_fd((hyperdht_t*)h);
+}
+
 extern "C" JNIEXPORT void JNICALL
 Java_com_hyperdht_Native_destroy(JNIEnv*, jobject, jlong h) {
     hyperdht_destroy((hyperdht_t*)h, nullptr, nullptr);
@@ -208,7 +238,17 @@ Java_com_hyperdht_Native_destroyForce(JNIEnv*, jobject, jlong h) {
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_com_hyperdht_Native_free(JNIEnv*, jobject, jlong h) {
+Java_com_hyperdht_Native_free(JNIEnv* env, jobject, jlong h) {
+    // H16: free event callback global refs before releasing the DHT handle
+    auto it = g_event_refs.find(h);
+    if (it != g_event_refs.end()) {
+        auto& refs = it->second;
+        if (refs.bootstrapped) { env->DeleteGlobalRef(*refs.bootstrapped); delete refs.bootstrapped; }
+        if (refs.networkChange) { env->DeleteGlobalRef(*refs.networkChange); delete refs.networkChange; }
+        if (refs.networkUpdate) { env->DeleteGlobalRef(*refs.networkUpdate); delete refs.networkUpdate; }
+        if (refs.persistent) { env->DeleteGlobalRef(*refs.persistent); delete refs.persistent; }
+        g_event_refs.erase(it);
+    }
     hyperdht_free((hyperdht_t*)h);
 }
 
@@ -307,14 +347,25 @@ static void jni_event_cb(void* ud) {
     env->CallVoidMethod(*ref, mid);
     check_exception(env);
     // Note: don't delete — event callbacks fire multiple times.
-    // Freed when DHT is destroyed (caller must release GlobalRefs).
+    // Freed when DHT is destroyed (via g_event_refs cleanup in Native_free).
+}
+
+// H16: helper to replace an event ref — frees old, stores new, tracks for cleanup
+static jobject* set_event_ref(JNIEnv* env, jlong h, jobject*& slot, jobject jcallback) {
+    if (slot) {
+        env->DeleteGlobalRef(*slot);
+        delete slot;
+    }
+    auto* ref = new jobject(env->NewGlobalRef(jcallback));
+    slot = ref;
+    return ref;
 }
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_hyperdht_Native_onBootstrapped(
     JNIEnv* env, jobject, jlong h, jobject jcallback)
 {
-    auto* ref = new jobject(env->NewGlobalRef(jcallback));
+    auto* ref = set_event_ref(env, h, g_event_refs[h].bootstrapped, jcallback);
     hyperdht_on_bootstrapped((hyperdht_t*)h, jni_event_cb, ref);
 }
 
@@ -322,7 +373,7 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_hyperdht_Native_onNetworkChange(
     JNIEnv* env, jobject, jlong h, jobject jcallback)
 {
-    auto* ref = new jobject(env->NewGlobalRef(jcallback));
+    auto* ref = set_event_ref(env, h, g_event_refs[h].networkChange, jcallback);
     hyperdht_on_network_change((hyperdht_t*)h, jni_event_cb, ref);
 }
 
@@ -330,7 +381,7 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_hyperdht_Native_onNetworkUpdate(
     JNIEnv* env, jobject, jlong h, jobject jcallback)
 {
-    auto* ref = new jobject(env->NewGlobalRef(jcallback));
+    auto* ref = set_event_ref(env, h, g_event_refs[h].networkUpdate, jcallback);
     hyperdht_on_network_update((hyperdht_t*)h, jni_event_cb, ref);
 }
 
@@ -338,7 +389,7 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_hyperdht_Native_onPersistent(
     JNIEnv* env, jobject, jlong h, jobject jcallback)
 {
-    auto* ref = new jobject(env->NewGlobalRef(jcallback));
+    auto* ref = set_event_ref(env, h, g_event_refs[h].persistent, jcallback);
     hyperdht_on_persistent((hyperdht_t*)h, jni_event_cb, ref);
 }
 
@@ -354,15 +405,18 @@ struct StreamCtx {
 
 static void jni_stream_open_cb(void* ud) {
     auto* ctx = static_cast<StreamCtx*>(ud);
+    LOGT("stream_open_cb fired ctx=%p", ctx);
     JNIEnv* env = get_env();
     jclass cls = env->GetObjectClass(ctx->onOpen);
     jmethodID mid = env->GetMethodID(cls, "run", "()V");
     env->CallVoidMethod(ctx->onOpen, mid);
     check_exception(env);
+    LOGT("stream_open_cb done");
 }
 
 static void jni_stream_data_cb(const uint8_t* data, size_t len, void* ud) {
     auto* ctx = static_cast<StreamCtx*>(ud);
+    LOGT("stream_data_cb fired ctx=%p len=%zu", ctx, len);
     JNIEnv* env = get_env();
 
     jbyteArray jdata = env->NewByteArray((jsize)len);
@@ -373,10 +427,12 @@ static void jni_stream_data_cb(const uint8_t* data, size_t len, void* ud) {
     env->CallVoidMethod(ctx->onData, mid, jdata);
     check_exception(env);
     env->DeleteLocalRef(jdata);
+    LOGT("stream_data_cb done");
 }
 
 static void jni_stream_close_cb(void* ud) {
     auto* ctx = static_cast<StreamCtx*>(ud);
+    LOGT("stream_close_cb fired ctx=%p", ctx);
     JNIEnv* env = get_env();
 
     jclass cls = env->GetObjectClass(ctx->onClose);
@@ -388,6 +444,7 @@ static void jni_stream_close_cb(void* ud) {
     env->DeleteGlobalRef(ctx->onData);
     env->DeleteGlobalRef(ctx->onClose);
     delete ctx;
+    LOGT("stream_close_cb done");
 }
 
 extern "C" JNIEXPORT jlong JNICALL
@@ -420,8 +477,10 @@ Java_com_hyperdht_Native_streamWrite(
 {
     jsize len = env->GetArrayLength(jdata);
     jbyte* data = env->GetByteArrayElements(jdata, nullptr);
+    LOGT("streamWrite h=%p len=%d", (void*)h, (int)len);
     int rc = hyperdht_stream_write(
         (hyperdht_stream_t*)h, (const uint8_t*)data, (size_t)len);
+    LOGT("streamWrite rc=%d", rc);
     env->ReleaseByteArrayElements(jdata, data, JNI_ABORT);
     return rc;
 }
@@ -469,6 +528,10 @@ static void jni_connect_stream_cb(int error,
         sctx->onOpen  = ctx->onOpen;
         sctx->onData  = ctx->onData;
         sctx->onClose = ctx->onClose;
+        // H20: null ctx refs — ownership transferred to sctx
+        ctx->onOpen = nullptr;
+        ctx->onData = nullptr;
+        ctx->onClose = nullptr;
 
         LOGT("calling stream_open dht=%p", ctx->dht);
         auto* stream = hyperdht_stream_open(
@@ -595,6 +658,7 @@ static void jni_connection_cb(const hyperdht_connection_t* conn, void* ud) {
 extern "C" JNIEXPORT jlong JNICALL
 Java_com_hyperdht_Native_serverCreate(JNIEnv*, jobject, jlong h) {
     auto sh = (jlong)hyperdht_server_create((hyperdht_t*)h);
+    if (sh == 0) return 0;  // H17: don't store ctx for null handle
     // Pre-create ServerCtx so setFirewall can be called before serverListen
     auto* ctx = new ServerCtx;
     ctx->callback = nullptr;
@@ -626,7 +690,9 @@ Java_com_hyperdht_Native_serverListen(
     }
     ctx->callback = env->NewGlobalRef(jcallback);
 
-    return hyperdht_server_listen((hyperdht_server_t*)sh, &kp, jni_connection_cb, ctx);
+    int rc = hyperdht_server_listen((hyperdht_server_t*)sh, &kp, jni_connection_cb, ctx);
+    hyperdht_keypair_zero(&kp);  // C10
+    return rc;
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -706,6 +772,8 @@ static int jni_firewall_cb(const uint8_t pk[32], const char* host,
     jmethodID mid = env->GetMethodID(cls, "onFirewall",
         "([BLjava/lang/String;I)Z");
     jboolean reject = env->CallBooleanMethod(*ref, mid, jpk, jhost, (jint)port);
+    // M19: if callback threw, fail closed (reject) rather than fail open
+    if (check_exception(env)) reject = JNI_TRUE;
 
     env->DeleteLocalRef(jpk);
     env->DeleteLocalRef(jhost);
@@ -894,6 +962,7 @@ Java_com_hyperdht_Native_mutablePut(
     int rc = hyperdht_mutable_put((hyperdht_t*)h, &kp,
         (const uint8_t*)data, (size_t)len, (uint64_t)seq, jni_done_cb, ctx);
     env->ReleaseByteArrayElements(jval, data, JNI_ABORT);
+    hyperdht_keypair_zero(&kp);  // C10
     if (rc != 0) { env->DeleteGlobalRef(ctx->callback); delete ctx; }
     return rc;
 }
@@ -1046,6 +1115,7 @@ Java_com_hyperdht_Native_unannounce(
     env->GetByteArrayRegion(jsk, 0, 64, (jbyte*)kp.secret_key);
     auto* ctx = new DoneCtx{env->NewGlobalRef(jDoneCb)};
     int rc = hyperdht_unannounce((hyperdht_t*)h, pubkey, &kp, jni_done_cb, ctx);
+    hyperdht_keypair_zero(&kp);  // C10
     if (rc != 0) { env->DeleteGlobalRef(ctx->callback); delete ctx; }
     return rc;
 }
@@ -1242,5 +1312,7 @@ Java_com_hyperdht_Native_connectEx(
     auto* ctx = new ConnectCtx;
     ctx->callback = env->NewGlobalRef(jcallback);
 
-    return hyperdht_connect_ex((hyperdht_t*)h, pk, &opts, jni_connect_cb, ctx);
+    int rc = hyperdht_connect_ex((hyperdht_t*)h, pk, &opts, jni_connect_cb, ctx);
+    if (opts.keypair) hyperdht_keypair_zero(&kp);  // C10
+    return rc;
 }

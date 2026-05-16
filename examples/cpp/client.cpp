@@ -2,7 +2,8 @@
  * HyperDHT client — connects to a server, sends a message, prints the echo.
  *
  * Usage:
- *   ./client <64-char-hex-public-key>
+ *   ./client <remote-pubkey>              # random identity
+ *   ./client <remote-pubkey> <our-seed>   # deterministic identity
  *
  * Build:
  *   g++ -std=c++20 -O2 client.cpp -I../../include -L../../build -lhyperdht -lsodium -luv -o client
@@ -21,8 +22,14 @@ struct ClientCtx {
 };
 
 static void on_data(const uint8_t* data, size_t len, void* ud) {
+    auto* ctx = static_cast<ClientCtx*>(ud);
     printf("Received: %.*s\n", (int)len, data);
     fflush(stdout);
+    // Half-close our side. Server's on_close fires once it also finishes,
+    // and CLAUDE.md gotcha #12: both sides must write_end before either
+    // side's on_close callback runs. Without this the stream lingers
+    // until UDX times out, leaving the peer to clean up via TLP/RTO.
+    hyperdht_stream_close(ctx->stream);
 }
 
 static void on_open(void* ud) {
@@ -37,6 +44,12 @@ static void on_close(void* ud) {
     printf("Stream closed\n");
     fflush(stdout);
     delete static_cast<ClientCtx*>(ud);
+    // Tear the DHT down so uv_run() in main() returns. hyperdht_free()
+    // is deferred to main() per the API contract — destroy() schedules,
+    // the post-destroy uv_run drains, then free() is safe.
+    if (g_dht) {
+        hyperdht_destroy(g_dht, nullptr, nullptr);
+    }
 }
 
 static void on_connect(int error, const hyperdht_connection_t* conn, void* ud) {
@@ -85,6 +98,17 @@ int main(int argc, char** argv) {
     hyperdht_opts_t opts;
     hyperdht_opts_default(&opts);
     opts.use_public_bootstrap = 1;
+
+    // Optional seed for deterministic identity
+    if (argc > 2 && strlen(argv[2]) == 64) {
+        for (int i = 0; i < 32; i++) {
+            unsigned byte;
+            sscanf(argv[2] + i * 2, "%02x", &byte);
+            opts.seed[i] = (uint8_t)byte;
+        }
+        opts.seed_is_set = 1;
+        printf("Using seed: %.16s...\n", argv[2]);
+    }
 
     g_dht = hyperdht_create(&loop, &opts);
     if (!g_dht) {

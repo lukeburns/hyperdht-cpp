@@ -75,6 +75,10 @@
 //   - Probe echo is a single global listener installed on first holepunch via
 //     `add_probe_listener` (multi-listener API), tracked in `probe_listener_id_`
 //     and removed on close().
+//
+// DoS hardening:
+//   - Concurrent pending handshakes capped at 256 (on_handshake_result)
+//   - Holepunch send_fn_ lambda captures weak alive_ sentinel
 
 #include "hyperdht/server.hpp"
 
@@ -364,6 +368,11 @@ void Server::on_peer_handshake(const std::vector<uint8_t>& noise,
             noise.size(), peer_address.host_string().c_str(), peer_address.port);
     if (closed_ || suspended_) return;
 
+    // M14: cap dedup map (entries without matching connections are stale)
+    if (handshake_dedup_.size() > 512 && handshake_dedup_.size() > connections_.size() * 2) {
+        handshake_dedup_.clear();
+    }
+
     // Dedup: same noise bytes = same client via different relay.
     // JS: server.js:464-473 (_onpeerhandshake) k = noise.toString('hex');
     //     if (_connects.has(k)) reuse session. We resend cached reply_noise.
@@ -397,6 +406,17 @@ void Server::on_peer_handshake(const std::vector<uint8_t>& noise,
     // holepunch. Without a HyperDHT back-pointer we can't reach the
     // cached validated list and the LAN advertisement silently no-ops.
     auto our_addrs = socket_.nat_sampler().addresses();
+    // After persistent transition, the NAT sampler still has addresses
+    // with client_socket_'s port (from pre-transition traffic). Replace
+    // with server_socket_'s port — that's the port we're now reachable
+    // on and the one the firewall is opened for.
+    if (!socket_.is_firewalled()) {
+        uint16_t server_port = socket_.port();
+        for (auto& addr : our_addrs) {
+            addr = compact::Ipv4Address::from_string(
+                addr.host_string(), server_port);
+        }
+    }
     if (share_local_address && dht_ != nullptr) {
         // Copy the vector by value (not by `const&`) so the append loop
         // cannot observe a mid-flight modification if the cache is
@@ -492,7 +512,8 @@ void Server::on_peer_handshake(const std::vector<uint8_t>& noise,
             auto res = server_connection::finalize_handshake(
                 std::move(*pending_shared), hp_id,
                 our_addrs, relay_infos, reject,
-                has_remote_addr, relay_through_shared);
+                has_remote_addr, relay_through_shared,
+                reusable_socket);
             on_handshake_result(hp_id, noise_key, has_remote_addr,
                                 relay_through_shared, reply_fn, std::move(res));
         });
@@ -510,7 +531,8 @@ void Server::on_peer_handshake(const std::vector<uint8_t>& noise,
     auto result = server_connection::finalize_handshake(
         std::move(*pending), hp_id,
         our_addrs, relay_infos, rejected,
-        has_remote_addr, relay_through_info);
+        has_remote_addr, relay_through_info,
+        reusable_socket);
 
     on_handshake_result(hp_id, noise_key, has_remote_addr,
                         relay_through_info, reply_fn, std::move(result));
@@ -529,6 +551,9 @@ void Server::on_handshake_result(
     std::optional<server_connection::ServerConnection> result) {
 
     if (closed_ || suspended_) return;
+    // H23: cap concurrent pending handshakes to prevent resource exhaustion
+    constexpr size_t MAX_PENDING_HANDSHAKES = 256;
+    if (connections_.size() >= MAX_PENDING_HANDSHAKES) return;
 
     if (!result.has_value()) {
         DHT_LOG("  [server] Noise handshake FAILED (finalize error)\n");
@@ -944,7 +969,9 @@ void Server::on_peer_holepunch(const std::vector<uint8_t>& value,
 
         if (!conn.puncher) {
             conn.puncher = std::make_shared<holepunch::Holepuncher>(socket_.loop(), false);
-            conn.puncher->set_send_fn([this](const compact::Ipv4Address& addr) {
+            auto weak = std::weak_ptr<bool>(alive_);  // H10: sentinel
+            conn.puncher->set_send_fn([weak, this](const compact::Ipv4Address& addr) {
+                if (auto a = weak.lock(); !a || !*a) return;
                 if (!closed_) socket_.send_probe(addr);
             });
             conn.puncher->set_local_firewall(our_fw);

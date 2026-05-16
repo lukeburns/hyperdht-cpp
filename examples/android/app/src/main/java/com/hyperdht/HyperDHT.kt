@@ -76,13 +76,31 @@ class HyperDHT(
             while (isActive && !destroyed) {
                 Native.loopRunOnce(loopHandle)
                 // Yield lets other tasks queued on this thread execute
-                // (connect, write, etc.) before the next uv_run iteration
+                // (connect, write, etc.) before the next uv_run iteration.
                 yield()
+                // Flush: tasks executed during yield() may have queued
+                // deferred libuv work (e.g. UDX's uv_prepare for packet
+                // sends).  A non-blocking run processes those callbacks
+                // so the data hits the wire BEFORE the next blocking poll,
+                // preventing a full round-trip delay on the echo path.
+                Native.loopRunNowait(loopHandle)
             }
         }
         return loopJob!!
     }
 
+    /**
+     * Shut down the DHT node and release all native resources.
+     *
+     * **WARNING — BLOCKS THE CALLING THREAD** for up to 5 seconds while
+     * libuv close callbacks drain. Never call from the Android UI thread
+     * (Dispatchers.Main) — it will freeze the screen and may trigger an
+     * ANR. Use `Dispatchers.IO` or a background thread:
+     *
+     * ```kotlin
+     * withContext(Dispatchers.IO) { dht.close() }
+     * ```
+     */
     override fun close() {
         if (destroyed) return
         destroyed = true
